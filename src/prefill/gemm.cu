@@ -1229,6 +1229,23 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     // a kernel that state does not break.  Only the shapes that fail are moved (the failing call itself is harmless);
     // the wide shapes, for which the fixed algorithms are markedly slower, stay on the default.
     const int64_t shape = ((int64_t) K << 32) | (uint32_t) N;
+    // STRATA_GEMM_ALGO=N (opt-in, default: the path above, byte-identical): a FIXED cuBLAS algorithm instead of
+    // CUBLAS_GEMM_DEFAULT.  On Turing (sm_75) the default heuristic answers these shapes with a SIMT kernel
+    // (volta_s884gemm_fp16_128x256_ldg8_tn) that reaches ~0.6 TFLOP/s, while a fixed algorithm picks the FP16 tensor
+    // core kernel: measured on a GTX 1660 Ti (24 SMs, 6 GB), n_out 8192 / n_in 2048 / T 2048 -> 614 GFLOP/s on the
+    // default against 5064 on ALGO6 (8.2x); every engine shape measured 4.6-5.1 TFLOP/s on ALGO6.  The products are
+    // the same ones in another summation order, so the numbers move in the last bits, as any cuBLAS version does.
+    static const cublasGemmAlgo_t fixed_algo = [] {
+        const char* v = std::getenv("STRATA_GEMM_ALGO");
+        if (!v || !v[0]) return CUBLAS_GEMM_DEFAULT;
+        const int n = std::atoi(v);
+        return n < 0 ? CUBLAS_GEMM_DEFAULT : (cublasGemmAlgo_t) n;
+    }();
+    if (fixed_algo != CUBLAS_GEMM_DEFAULT) {
+        ck(f16_gemm(fixed_algo), "cublasGemmEx f16 (STRATA_GEMM_ALGO)");
+        STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx f16");
+        return;
+    }
     cublasGemmAlgo_t algo = CUBLAS_GEMM_DEFAULT;
     for (int i = 0; i < f16_algo_n_; ++i)
         if (f16_algo_shape_[i] == shape) { algo = CUBLAS_GEMM_ALGO2; break; }

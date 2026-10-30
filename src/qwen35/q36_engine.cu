@@ -1257,6 +1257,8 @@ struct Engine {
     uint8_t* acts = nullptr;   // per token: its quantized activation (kNativeActBytes)
     cudaEvent_t ev_route = nullptr;
     uint8_t* stage[2] = {};
+    uint8_t* stage_mem = nullptr;   // one allocation holding n_stage buffers of max_layer + kMmqTail
+    int n_stage = 2;                // staging buffers: 2 overlap the copy with the layer before, 1 is a serial fallback
     cudaStream_t cst = nullptr;
     cudaEvent_t ev_copy[2] = {}, ev_used[2] = {};
     std::vector<int> stream_seq;   // the state indices a streamed forward visits, in order
@@ -1420,7 +1422,11 @@ struct Engine {
         ami = dalloc_t<int32_t>((size_t) kArgBlocks * kVerify);
         CK(cudaHostAlloc((void**) &hpin, 64 * sizeof(int32_t), cudaHostAllocDefault));
         n_chunk = (ctx + kChunkCells - 1) / kChunkCells;
-        att_rows = (int) (g.n_head * std::min<int64_t>((int64_t) T, 64));   // 64 query tokens per attention batch
+        // The split-K partials (pacc / pm / pl) are only read by the row path, which runs for T <= kGemmT rows: the
+        // prompt chunks take the FP16 GEMMs over att_s / att_p16 instead.  Sizing this at 64 query rows (as it was)
+        // allocated eight times what the row path can use, and pacc grows with the context (1 MiB per 256-cell chunk
+        // at 16 heads x 256 dim x 4 bytes): 256 MiB at a 64K context, 512 MiB at 128K, against the 768 MiB reserve.
+        att_rows = (int) (g.n_head * std::min<int64_t>((int64_t) T, kGemmT));   // one row batch per attention call
         pacc = dalloc((size_t) att_rows * n_chunk * g.head_dim);
         pm = dalloc((size_t) att_rows * n_chunk);
         pl = dalloc((size_t) att_rows * n_chunk);
@@ -1955,6 +1961,18 @@ struct Engine {
                 const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (kAttScoreFloats / ((size_t) H * ldp))));
                 const int G = H / HKV;
                 const float one = 1.0f, zero = 0.0f;
+                // The two attention GEMMs are skinny: K is HD = 256 for the scores and P (thousands) for the values, and
+                // the batch is only G = 8.  cuBLAS's default heuristic picks a SIMT kernel for them on Turing: measured on
+                // this card (GTX 1660 Ti, sm_75, .ab.cu) at P = 23424, nt = 44, the scores take 10.05 ms under
+                // CUBLAS_GEMM_DEFAULT against 1.31 ms under ALGO3, and the values 15.02 ms against 1.82 ms.  The
+                // algorithm is the same sum in a different order, so the last bits may differ; the default path stays
+                // byte-identical (STRATA_ATTN_ALGO unset means CUBLAS_GEMM_DEFAULT).
+                static const cublasGemmAlgo_t attn_algo = [] {
+                    const char* v = std::getenv("STRATA_ATTN_ALGO");
+                    if (!v || !v[0]) return CUBLAS_GEMM_DEFAULT;
+                    const int n = std::atoi(v);
+                    return n < 0 ? CUBLAS_GEMM_DEFAULT : (cublasGemmAlgo_t) n;
+                }();
                 k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(q, q16, (int64_t) T * H * HD);
                 for (int t0 = 0; t0 < T; t0 += tq) {
                     const int nt = std::min(tq, T - t0);
@@ -1965,7 +1983,7 @@ struct Engine {
                         float* Sh = att_s + (size_t) kvh * G * nt * ldp;
                         if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &one, Kh, CUDA_R_16F, HD,
                                                        0, Qh, CUDA_R_16F, H * HD, HD, &zero, Sh, CUDA_R_32F, ldp,
-                                                       (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                                                       (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, attn_algo) !=
                             CUBLAS_STATUS_SUCCESS) {
                             std::fprintf(stderr, "strata-q36: attention scores GEMM failed\n");
                             std::exit(1);
@@ -1979,7 +1997,7 @@ struct Engine {
                         float* Oh = att + ((size_t) t0 * H + kvh * G) * HD;
                         if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, nt, P, &one, Vh, CUDA_R_16F, HD,
                                                        0, Sh, CUDA_R_16F, ldp, (long long) nt * ldp, &zero, Oh, CUDA_R_32F,
-                                                       H * HD, HD, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                                                       H * HD, HD, G, CUBLAS_COMPUTE_32F, attn_algo) !=
                             CUBLAS_STATUS_SUCCESS) {
                             std::fprintf(stderr, "strata-q36: attention values GEMM failed\n");
                             std::exit(1);
@@ -2173,10 +2191,10 @@ struct Engine {
     void stream_begin(const std::vector<int>& seq) {
         stream_seq = seq;
         stream_pos = 0;
-        for (int i = 0; i < 2 && i < (int) seq.size(); ++i) stream_kick(i);
+        for (int i = 0; i < n_stage && i < (int) seq.size(); ++i) stream_kick(i);
     }
-    void stream_kick(int i) {   // the i-th layer of the sequence into staging buffer i % 2, after its last reader
-        const int b = i % 2;
+    void stream_kick(int i) {   // the i-th layer of the sequence into staging buffer i % n_stage, after its last reader
+        const int b = i % n_stage;
         const Layer& L = layer_at(stream_seq[(size_t) i]);
         CK(cudaStreamWaitEvent(cst, ev_used[b], 0));
         // the experts with a VRAM slot come from it (device to device, at VRAM speed), only the others over PCIe; runs
@@ -2214,14 +2232,14 @@ struct Engine {
             std::fprintf(stderr, "strata-q36: the expert stream is out of step (layer %d)\n", li);
             std::exit(1);
         }
-        const int b = stream_pos % 2;
+        const int b = stream_pos % n_stage;
         CK(cudaStreamWaitEvent(st, ev_copy[b], 0));
         return stage[b];
     }
     void stream_done() {
-        const int b = stream_pos % 2;
+        const int b = stream_pos % n_stage;
         CK(cudaEventRecord(ev_used[b], st));
-        if (stream_pos + 2 < (int) stream_seq.size()) stream_kick(stream_pos + 2);
+        if (stream_pos + n_stage < (int) stream_seq.size()) stream_kick(stream_pos + n_stage);
         ++stream_pos;
     }
 
@@ -2897,7 +2915,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     E.mtp_graph = false;                      // the MTP block's layer is hybrid either way
     E.hybrid_t = std::max(1, std::min(hybrid_t, E.use_mmq ? E.tmax : E.tmax));
     if (!E.use_mmq) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
-    const size_t staging = E.use_mmq && E.main_hybrid ? 2 * (max_layer + kMmqTail) : 0;
+    // Two staging buffers overlap a layer's expert copy with the layer before it.  One is enough to run, and on a card
+    // this tight the second buffer is often the difference between a 64K context at chunk 2048 and not: the budget
+    // check below retries at n_stage = 1 before it gives up.
+    E.n_stage = 2;
+    size_t staging = E.use_mmq && E.main_hybrid ? (size_t) E.n_stage * (max_layer + kMmqTail) : 0;
     size_t slot_bytes = budget2 > staging ? budget2 - staging : 0;
     if (slot_bytes + staging + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging + ((size_t) 512 << 20) ? fr - staging - ((size_t) 512 << 20) : 0;
     // --expert-slots: that many per layer (tests: the same split with and without the MTP block)
@@ -2908,11 +2930,25 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     }
     {   // what the hybrid mode allocates next (the staging pair, the CPU part's outputs, the slots) against the VRAM the
         // sessions and the context left: said with the numbers instead of a cudaMalloc failure (8 slots on a 12 GB card)
+        // The CPU part's outputs (ecpu / d_miss, allocated below) only ever hold a rows-path batch, i.e. at most
+        // hybrid_t rows - except when only the MTP block is hybrid, where every batch of it goes down the rows path.
+        // Sizing them at tmax charged the whole prompt chunk (134 MB at chunk 2048, N 2048, K 8) for a buffer that
+        // never sees more than hybrid_t rows; at a 64K context on a 6 GB card that alone was the difference between
+        // running and "not enough VRAM left".
         const size_t Tn = (size_t) E.tmax, Nn = (size_t) g.n_embd, Kn = (size_t) m.top_k;
-        size_t need = staging + Tn * Kn * Nn * 4 + Tn * Kn * 4;
+        const size_t hy_n = E.main_hybrid ? (size_t) E.hybrid_t : Tn;   // the rows-path batch, in rows
+        size_t need = staging + hy_n * Kn * Nn * 4 + hy_n * Kn * 4;
         for (Layer* L : all) {
             if (mtp_only && L != &m.mtp) need += L->stride * (size_t) ne + kMmqTail;
             else need += (S > 0 ? (size_t) S * L->stride + kMmqTail : 0);
+        }
+        if (need > fr && E.n_stage > 1) {   // give the double buffer back rather than refuse the context
+            const size_t one = max_layer + kMmqTail;
+            E.n_stage = 1;
+            staging -= one;
+            need -= one;
+            std::fprintf(stderr, "strata-q36: the second expert staging buffer (%.0f MiB) given back so that the context "
+                                 "fits; the layer copies run one at a time\n", (double) one / (1 << 20));
         }
         if (need > fr) {
             err = "not enough VRAM left for the hybrid experts' buffers and slots (" + std::to_string((need >> 20)) +
@@ -2978,20 +3014,37 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         }
     }
     const size_t T = (size_t) E.tmax, N = (size_t) g.n_embd, Kp = (size_t) m.top_k;
-    CK(cudaHostAlloc((void**) &E.h_h, T * N * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void**) &E.cpu_out, T * Kp * N * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void**) &E.h_ids, T * Kp * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void**) &E.h_miss, T * Kp * 4, cudaHostAllocDefault));
+    // The CPU part's staging (and the entries it carries) is sized for the rows path's batch, not the prompt chunk: see
+    // the note at `hy_n` above.  Every one of these buffers is only touched from moe_hybrid_gpu / moe_hybrid_cpu, which
+    // run for at most E.hybrid_t rows unless only the MTP block is hybrid.
+    const size_t Th = E.main_hybrid ? (size_t) E.hybrid_t : T;
+    CK(cudaHostAlloc((void**) &E.h_h, Th * N * 4, cudaHostAllocDefault));
+    CK(cudaHostAlloc((void**) &E.cpu_out, Th * Kp * N * 4, cudaHostAllocDefault));
+    CK(cudaHostAlloc((void**) &E.h_ids, Th * Kp * 4, cudaHostAllocDefault));
+    CK(cudaHostAlloc((void**) &E.h_miss, Th * Kp * 4, cudaHostAllocDefault));
     CK(cudaHostAlloc((void**) &E.h_cnt, all.size() * (size_t) ne * 4, cudaHostAllocDefault));
-    CK(cudaMalloc(&E.ecpu, T * Kp * N * 4));
-    CK(cudaMalloc(&E.d_miss, T * Kp * 4));
-    E.acts = (uint8_t*) std::malloc(T * C::kNativeActBytes + 64);
+    CK(cudaMalloc(&E.ecpu, Th * Kp * N * 4));
+    CK(cudaMalloc(&E.d_miss, Th * Kp * 4));
+    E.acts = (uint8_t*) std::malloc(Th * C::kNativeActBytes + 64);
     CK(cudaEventCreateWithFlags(&E.ev_route, cudaEventDisableTiming));
-    if (staging) {
+    if (staging) {   // one allocation for E.n_stage buffers; the arithmetic above cannot see fragmentation, so a real
+                     // failure of the double buffer falls back to a single one here as well
+        const size_t one = max_layer + kMmqTail;
         CK(cudaStreamCreateWithFlags(&E.cst, cudaStreamNonBlocking));
-        for (int b = 0; b < 2; ++b) {
-            CK(cudaMalloc(&E.stage[b], max_layer + kMmqTail));
-            CK(cudaMemset(E.stage[b], 0, max_layer + kMmqTail));
+        if (cudaMalloc(&E.stage_mem, one * (size_t) E.n_stage) != cudaSuccess) {
+            (void) cudaGetLastError();
+            if (E.n_stage == 1) {
+                err = "no VRAM for the expert staging buffer (" + std::to_string(one >> 20) + " MiB)";
+                return false;
+            }
+            E.n_stage = 1;
+            std::fprintf(stderr, "strata-q36: the second expert staging buffer (%.0f MiB) given back so that the context "
+                                 "fits; the layer copies run one at a time\n", (double) one / (1 << 20));
+            CK(cudaMalloc(&E.stage_mem, one));
+        }
+        CK(cudaMemset(E.stage_mem, 0, one * (size_t) E.n_stage));
+        for (int b = 0; b < E.n_stage; ++b) {
+            E.stage[b] = E.stage_mem + (size_t) b * one;
             CK(cudaEventCreateWithFlags(&E.ev_copy[b], cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&E.ev_used[b], cudaEventDisableTiming));
             CK(cudaEventRecord(E.ev_used[b], E.st));

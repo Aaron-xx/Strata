@@ -846,14 +846,17 @@ STRATA_TQP_FMT(149)
 #define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(147) X(148) X(149)
 #endif
 // Q5_K / Q6_K downs: Qwen3.6-35B-A3B (FF 512, whole 256-blocks per row); Flash-Next's FF 640 never selects them.
-// IQ3_S (21) and IQ2_S (22) are here because Unsloth's UD-IQ3_S of this family puts them in ffn_down_exps (37 IQ3_S
-// layers, 3 IQ4_XS, the rest IQ2_S); their Split<> traits and iq_row_bytes rows already existed for the gate/up role,
-// so the down projection only needed the dispatch entry.  n_ff 512 gives hb = 16, which takes
-// native_down_multi_kernel's generic warp-per-row path (the 8-lane rows want hb == 20).
+// The down projection needs its own list because a GGUF may quantise ffn_down_exps differently from ffn_gate_exps, and
+// Unsloth's UD files of this family all do: UD-IQ3_S puts IQ3_S (21) / IQ2_S (22) / IQ4_XS (23) there, UD-Q4_K_S
+// puts Q4_K (12) there, UD-Q2_K_XL and UD-IQ2_M put IQ2_XXS (16) / IQ2_XS (17) / IQ3_XXS (18) there.  Each of those
+// formats already had Fmt<>, Split<> and an iq_row_bytes row for the gate/up role, so the down projection only needed
+// the dispatch entry; without it the loader refused the whole file with "experts are X/Y, which the native expert
+// kernels do not take".  n_ff 512 gives hb = 16, which takes native_down_multi_kernel's generic warp-per-row path
+// (the 8-lane rows want hb == 20).
 #ifdef STRATA_Q6K_EXPERTS
-#define STRATA_D_FMTS(X) X(20) X(21) X(22) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(14) X(40) X(144) X(146) X(147) X(148) X(149)
+#define STRATA_D_FMTS(X) X(12) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(14) X(40) X(144) X(146) X(147) X(148) X(149)
 #else
-#define STRATA_D_FMTS(X) X(20) X(21) X(22) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(40) X(144) X(146) X(147) X(148) X(149)
+#define STRATA_D_FMTS(X) X(12) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(40) X(144) X(146) X(147) X(148) X(149)
 #endif
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(146) X(147) X(148) X(149)
 template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 2, step = 4;     // NVFP4: 2 calls of 32 values
