@@ -4870,6 +4870,13 @@ class Service:
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
+        # Thinking off: the generation prompt the template writes already carries the empty thinking block
+        # (`<|im_start|>assistant\n<think>\n\n</think>\n\n`), so every assistant turn of the history has to render it
+        # the same way or the next turn's prompt stops being an extension of the previous one - the engine's session
+        # cache then matches nothing and the whole conversation is read again.  With nothing generated inside the
+        # block it costs no tokens, and a template that does not read the name ignores it.
+        if off and "preserve_thinking" not in kwargs:
+            kwargs = {**kwargs, "preserve_thinking": True}
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
             return self.template.render(messages, tools=tools, **kwargs)
         base = {k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}

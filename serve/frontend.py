@@ -610,11 +610,16 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     # `false` is a level (thinking off, effort_kwargs): an `or` between the two fields dropped it
     kwargs.update(effort_kwargs(given if given is not None and given != "" else reasoning.get("effort")))
     # the vLLM / llama.cpp convention: {"chat_template_kwargs": {"enable_thinking": false, "reasoning_effort": "low"}}
+    # Any other key the template itself reads (preserve_thinking, add_vision_id, ...) is passed through untouched:
+    # the template decides what it means, and a client that sends one expects the prompt to carry it.  Without this
+    # a key such as preserve_thinking was dropped and the rendered prompt differed from what the client asked for.
     for k, v in (req.get("chat_template_kwargs") or {}).items():
         if k == "enable_thinking" and not v:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
+        elif k not in ("enable_thinking", "reasoning_effort"):
+            kwargs[k] = v
     return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 
 
