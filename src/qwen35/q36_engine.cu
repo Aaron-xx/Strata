@@ -2831,7 +2831,15 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     }
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
-    const size_t reserve = (size_t) 768 << 20;
+    // The reserve is what the driver, the CUDA context and anything else on the card may take later; the placement
+    // arithmetic subtracts it from the free VRAM.  768 MiB is the safe figure, but on a 6 GB card it is also often the
+    // difference between a 64K context at chunk 1024 and not, so STRATA_Q36_RESERVE_MIB lowers it (a driver that needs
+    // more later makes the cudaMalloc calls below fail, which is said with the numbers instead of silently).
+    static const size_t reserve = [] {
+        const char* v = std::getenv("STRATA_Q36_RESERVE_MIB");
+        const int mib = v ? std::atoi(v) : 0;
+        return mib > 0 ? (size_t) mib << 20 : (size_t) 768 << 20;
+    }();
     const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30))
                                         : (fr > reserve ? fr - reserve : 0);
     // every expert fits once the packed Q8_0 decode copies are given back (a file a few GiB larger than the card's
