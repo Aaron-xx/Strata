@@ -1699,6 +1699,9 @@ struct Engine {
     /// Copy the current session's state (as of cell ntok) into a new snapshot, dropping the oldest.
     void snap_take(Sess& ss, const std::vector<int32_t>& ids, size_t ntok) {
         if (snap_keep <= 0 || ntok == 0 || ntok != (size_t) pos || ntok > ids.size()) return;   // pos: the cells processed
+        // The same cell boundary is taken twice (a chunk end and then the step before the prompt's tail), and the same state
+        // twice is no help: a ring of duplicates evicts the older, shorter starts that a growing chat does match.
+        for (const Sess::Snap& sn : ss.snaps) if (sn.pos == (int64_t) ntok) return;
         const auto& g = m->g;
         const size_t nconv = (size_t) g.ssm_conv_channels * (size_t) (g.ssm_d_conv - 1);
         const size_t nst = (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size;
