@@ -361,6 +361,101 @@ __global__ void k_attn_part(const float* q, const int8_t* kc, const int8_t* vc, 
         pl[o] = l;
     }
 }
+/// Decode attention, one block per (256-cell chunk, row, KV head): the eight query heads that share one KV head stream
+/// that KV head's rows once, score them with four-way int8 dot products and accumulate the eight outputs in registers.
+/// At 45k cells k_attn_part read the same rows eight times, one block per query head, and widened every int8 value to
+/// float one at a time: 113 ms of a 145 ms token there, 6.9 tokens/s.  Same partials as k_attn_part (pacc / pm / pl per
+/// row and chunk), so k_attn_merge is unchanged.  Queries are quantised to int8 per head (absmax / 127), the same trade
+/// the 8-bit KV cache already makes; STRATA_Q36_ATTN_OLD=1 keeps the exact float path.
+/// grid (n_chunk, nt * HKV), block 256, HD == 256, H / HKV == 8.
+__device__ __forceinline__ int dp4a_s8(int a, int b, int c) {
+#if __CUDA_ARCH__ >= 610
+    return __dp4a(a, b, c);
+#else
+    const signed char* x = (const signed char*) &a;
+    const signed char* y = (const signed char*) &b;
+    return c + (int) x[0] * y[0] + (int) x[1] * y[1] + (int) x[2] * y[2] + (int) x[3] * y[3];
+#endif
+}
+
+__global__ void k_attn_flash(const float* q, const int8_t* kc, const int8_t* vc, const int32_t* pos0, int t0, int H,
+                             int HKV, int ctx, float scale, int n_chunk, float* pacc, float* pm, float* pl, RowSel rs) {
+    constexpr int HD = 256, G = 8;
+    __shared__ int q4[G][HD / 4];           // this row's eight queries, int8, four to an int
+    __shared__ float qsc[G];                // per head: absmax / 127
+    __shared__ float sc[G][kChunkCells];    // this chunk's weights per head, already times the V row's scale
+    __shared__ float sh[kThreads];
+    const int c = blockIdx.x, y = blockIdx.y, kvh = y % HKV, tl = y / HKV;
+    const int t = t0 + tl, j = threadIdx.x;
+    const int npos = (rs.cell ? rs.cell[t] : *pos0 + t) + 1;
+    if (rs.kc) {
+        kc = rs.kc[rs.slot[t]];
+        vc = rs.vc[rs.slot[t]];
+    }
+    const int p0 = c * kChunkCells;
+    if (p0 >= npos) return;
+    const float* qrow = q + ((size_t) t * H + kvh * G) * HD;
+    int8_t* q8 = (int8_t*) q4;
+    for (int h = 0; h < G; ++h) {
+        const float v = qrow[(size_t) h * HD + j];
+        const float am = block_max(fabsf(v), sh);
+        const float s0 = am > 1e-20f ? am / 127.0f : 0.0f;
+        q8[(size_t) h * HD + j] = (int8_t) __float2int_rn(s0 > 0.f ? v / s0 : 0.f);
+        if (j == 0) qsc[h] = s0;
+    }
+    __syncthreads();
+    // one cell per thread, for all eight heads at once: the K row is loaded once per four dimensions per head
+    int acc[G];
+    #pragma unroll
+    for (int h = 0; h < G; ++h) acc[h] = 0;
+    const int p = p0 + j;
+    if (p < npos) {
+        const int* kp = (const int*) (kc + ((size_t) kvh * ctx + p) * HD);
+        for (int i = 0; i < HD / 4; ++i) {
+            const int kx = __ldg(kp + i);
+            #pragma unroll
+            for (int h = 0; h < G; ++h) acc[h] = dp4a_s8(kx, q4[h][i], acc[h]);
+        }
+    }
+    const float* kvs = (const float*) (kc + (size_t) HKV * ctx * HD);
+    const float* vvs = (const float*) (vc + (size_t) HKV * ctx * HD);
+    const float krow = p < npos ? kvs[(size_t) kvh * ctx + p] : 0.f;
+    const float vrow = p < npos ? vvs[(size_t) kvh * ctx + p] : 0.f;
+    float mh[G], lh[G];
+    #pragma unroll
+    for (int h = 0; h < G; ++h) {
+        const float s = p < npos ? (float) acc[h] * qsc[h] * krow * scale : -INFINITY;
+        const float m = block_max(s, sh);
+        const float e = p < npos ? expf(s - m) : 0.f;
+        const float l = block_sum(e, sh);
+        sc[h][j] = e * vrow;
+        mh[h] = m;
+        lh[h] = l;
+    }
+    // this thread's dimension of the eight outputs: one V byte is read once and used by all eight heads
+    const int n = min(kChunkCells, npos - p0);
+    float out[G];
+    #pragma unroll
+    for (int h = 0; h < G; ++h) out[h] = 0.f;
+    const int8_t* vp = vc + ((size_t) kvh * ctx + p0) * HD + j;
+    for (int k = 0; k < n; ++k) {
+        const float v = (float) vp[(size_t) k * HD];
+        #pragma unroll
+        for (int h = 0; h < G; ++h) out[h] += sc[h][k] * v;
+    }
+    #pragma unroll
+    for (int h = 0; h < G; ++h) {
+        const size_t o = (size_t) (tl * H + kvh * G + h) * n_chunk + c;
+        pacc[o * HD + j] = out[h];
+        if (j == 0) {
+            pm[o] = mh[h];
+            pl[o] = lh[h];
+        }
+    }
+}
+
+
+
 /// int8 cache rows widened to FP16 for the prompt's GEMMs: dst [kvh][ctx][HD] halves, src [kvh][ctx][HD] int8 with a
 /// FP32 scale per row (the same layout k_attn_prep writes).  Grid covers HKV * P * HD elements.
 __global__ void k_kv_deint8(const int8_t* q, const float* sc, __half* d, int HKV, int ctx, int HD, int P) {
@@ -2154,13 +2249,24 @@ struct Engine {
                 // split-K over 256-cell chunks; the chunk grid covers every cell a row can see (graph mode: the whole
                 // context, past-the-end chunks return at once)
                 const int rows_per = att_rows / H;
+                const int G = H / HKV;
+                // the eight-heads-per-block path: same partials, 8x less KV traffic, int8 scores (STRATA_Q36_ATTN_OLD=1
+                // keeps the exact float path)
+                const bool flash = G == 8 && HD == 256 && std::getenv("STRATA_Q36_ATTN_OLD") == nullptr;
                 for (int t0 = 0; t0 < T; t0 += rows_per) {
                     const int nt = std::min(rows_per, T - t0);
                     const int nc = graph_mode ? n_chunk
                                               : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
-                    k_attn_part<<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, rows_mode ? nullptr : kc[li],
-                                                                         rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx,
-                                                                         1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs);
+                    if (flash) {
+                        k_attn_flash<<<dim3(nc, nt * HKV), kThreads, 0, st>>>(q, rows_mode ? nullptr : kc[li],
+                                                                                  rows_mode ? nullptr : vc[li], dpos, t0, H, HKV,
+                                                                                  ctx, 1.0f / sqrtf((float) HD), n_chunk, pacc, pm,
+                                                                                  pl, rs);
+                    } else {
+                                        k_attn_part<<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, rows_mode ? nullptr : kc[li],
+                                                                             rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx,
+                                                                             1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs);
+                    }
                     k_attn_merge<<<nt * H, HD, 0, st>>>(pacc, pm, pl, gate, dpos, t0, H, n_chunk, att, rs);
                 }
             }
