@@ -29,7 +29,11 @@ namespace cpu = strata::kernels::cpu;
 
 namespace {
 
-constexpr int64_t kH = 2560, kFF = 640;
+int64_t env_i64(const char* n, int64_t d) {   // the shape of another model (Qwen3.6: 2048 / 512) must be measurable too
+    const char* v = std::getenv(n);
+    return v != nullptr && *v != 0 ? std::atoll(v) : d;
+}
+const int64_t kH = env_i64("STRATA_KQBENCH_H", 2560), kFF = env_i64("STRATA_KQBENCH_FF", 640);
 constexpr int kMaxT = 8;
 
 int type_of(const std::string& s) {
