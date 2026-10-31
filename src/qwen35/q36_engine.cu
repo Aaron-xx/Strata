@@ -1231,6 +1231,16 @@ struct Engine {
         std::vector<ImgKey> imgs;           // the pictures among them
         bool active = false;                // a batch slot is decoding in it
         uint64_t used = 0;                  // when it was last used (the LRU pick)
+        // The recurrent state as of a cell boundary of a prompt read (STRATA_Q36_SNAP): a later prompt that starts with
+        // live[] restores it and reads only the tail.  The KV cache needs no copy - it is addressed by cell, and the cells
+        // past pos are written again as the tail is read.
+        struct Snap {
+            int64_t pos = 0;
+            int32_t rdelta = 0;
+            std::vector<int32_t> live;
+            std::vector<float> conv, S, hl;
+        };
+        std::vector<Snap> snaps;
     };
     std::vector<Sess> sess;
     int n_sess = 1, cur = 0;
@@ -1571,6 +1581,92 @@ struct Engine {
         pos = 0;
         sess[(size_t) cur].pos = 0;
         set_delta(0);
+    }
+
+    // ---- prompt-state snapshots (STRATA_Q36_SNAP=N, default 0 = off).  A chat turn re-renders the whole conversation, so
+    // the tokens the engine holds after answering are almost never a proper start of the next prompt (the reply's text does
+    // not tokenize back to the ids that were sampled), and the GDN layers' recurrent state cannot be stepped back: without a
+    // copy of it every turn reads the whole prompt again.  A copy taken at a chunk boundary of a read is a state the next
+    // prompt can extend - restore it and read only the tail.
+    int snap_keep = 0;
+    int snap_tail = 8;   // the prompt's own last tokens are read as their own chunk, so a snapshot sits just before them
+    int snap_debug = 0;
+    /// the bytes one snapshot of ss's state holds: the GDN layers' conv and S, and the last hidden row
+    size_t snap_bytes(const Sess& ss) const {
+        const auto& g = m->g;
+        size_t n = (size_t) g.n_embd;
+        for (size_t l = 0; l < ss.conv.size(); ++l) {
+            if (ss.conv[l]) n += (size_t) g.ssm_conv_channels * (size_t) (g.ssm_d_conv - 1);
+            if (ss.S[l]) n += (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size;
+        }
+        return n * 4;
+    }
+    /// Copy the current session's state (as of cell ntok) into a new snapshot, dropping the oldest.
+    void snap_take(Sess& ss, const std::vector<int32_t>& ids, size_t ntok) {
+        if (snap_keep <= 0 || ntok == 0 || ntok != (size_t) pos || ntok > ids.size()) return;   // pos: the cells processed
+        const auto& g = m->g;
+        const size_t nconv = (size_t) g.ssm_conv_channels * (size_t) (g.ssm_d_conv - 1);
+        const size_t nst = (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size;
+        size_t nc = 0, ns = 0;
+        for (size_t l = 0; l < ss.conv.size(); ++l) {
+            nc += ss.conv[l] ? 1 : 0;
+            ns += ss.S[l] ? 1 : 0;
+        }
+        if ((int) ss.snaps.size() >= snap_keep) ss.snaps.erase(ss.snaps.begin());
+        ss.snaps.emplace_back();
+        Sess::Snap& sn = ss.snaps.back();
+        sn.pos = (int64_t) ntok;
+        sn.rdelta = ss.rdelta;
+        sn.live.assign(ids.begin(), ids.begin() + (long) ntok);
+        sn.conv.resize(nc * nconv);
+        sn.S.resize(ns * nst);
+        sn.hl.resize((size_t) g.n_embd);
+        size_t o = 0;
+        for (size_t l = 0; l < ss.conv.size(); ++l)
+            if (ss.conv[l]) {
+                CK(cudaMemcpyAsync(sn.conv.data() + o, ss.conv[l], nconv * 4, cudaMemcpyDeviceToHost, st));
+                o += nconv;
+            }
+        o = 0;
+        for (size_t l = 0; l < ss.S.size(); ++l)
+            if (ss.S[l]) {
+                CK(cudaMemcpyAsync(sn.S.data() + o, ss.S[l], nst * 4, cudaMemcpyDeviceToHost, st));
+                o += nst;
+            }
+        CK(cudaMemcpyAsync(sn.hl.data(), ss.hlast, (size_t) g.n_embd * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+    }
+    /// Put snapshot i of ss back: the GDN state, the last hidden row, the cell and the rotary offset.  The KV cells past
+    /// it keep what they held; the read that follows writes them again.
+    bool snap_restore(Sess& ss, size_t i) {
+        if (i >= ss.snaps.size()) return false;
+        const auto& g = m->g;
+        const Sess::Snap& sn = ss.snaps[i];
+        const size_t nconv = (size_t) g.ssm_conv_channels * (size_t) (g.ssm_d_conv - 1);
+        const size_t nst = (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size;
+        size_t o = 0;
+        for (size_t l = 0; l < ss.conv.size(); ++l)
+            if (ss.conv[l]) {
+                if (o + nconv > sn.conv.size()) return false;
+                CK(cudaMemcpyAsync(ss.conv[l], sn.conv.data() + o, nconv * 4, cudaMemcpyHostToDevice, st));
+                o += nconv;
+            }
+        o = 0;
+        for (size_t l = 0; l < ss.S.size(); ++l)
+            if (ss.S[l]) {
+                if (o + nst > sn.S.size()) return false;
+                CK(cudaMemcpyAsync(ss.S[l], sn.S.data() + o, nst * 4, cudaMemcpyHostToDevice, st));
+                o += nst;
+            }
+        if (sn.hl.size() != (size_t) g.n_embd) return false;
+        CK(cudaMemcpyAsync(ss.hlast, sn.hl.data(), (size_t) g.n_embd * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaStreamSynchronize(st));
+        ss.pos = sn.pos;
+        ss.live = sn.live;
+        pos = sn.pos;
+        sess[(size_t) cur].pos = sn.pos;
+        set_delta(sn.rdelta);
+        return true;
     }
 
     /// y [T][n_out] = W x [T][n_in] on the native MMVQ, 8 columns per launch.
@@ -2755,6 +2851,7 @@ struct Engine {
         b.rdelta = a.rdelta;
         b.live = a.live;
         b.imgs = a.imgs;
+        b.snaps = a.snaps;
         if (dst == cur) load_cur();
     }
     int hybrid_swaps_after_prompt = 2048;
@@ -3313,6 +3410,26 @@ struct Serve {
 
     explicit Serve(Engine& e) : E(e), slots((size_t) e.n_sess) {
         if (const char* v = std::getenv("STRATA_Q36_READ_WINDOWS")) read_windows = std::max(0, std::min(64, std::atoi(v)));
+        if (const char* v = std::getenv("STRATA_Q36_SNAP")) E.snap_keep = std::max(0, std::min(16, std::atoi(v)));
+        if (const char* v = std::getenv("STRATA_Q36_SNAP_TAIL")) E.snap_tail = std::max(0, std::min(512, std::atoi(v)));
+        if (const char* v = std::getenv("STRATA_Q36_SNAP_DEBUG")) E.snap_debug = std::atoi(v);
+        if (E.snap_keep > 0) {
+            const size_t b = E.snap_bytes(E.sess[0]);
+            std::fprintf(stderr, "strata-q36: %d prompt snapshots per session (%.0f MiB each, %.0f MiB of host memory): a "
+                         "prompt that extends one of them reads only its tail\n", E.snap_keep, (double) b / (1 << 20),
+                         (double) (b * (size_t) E.snap_keep) / (1 << 20));
+        }
+    }
+
+    /// The longest snapshot start of ids in ss (0 when none): see Engine::snap_restore.
+    size_t snap_len(const Engine::Sess& ss, const std::vector<int32_t>& ids) const {
+        size_t best = 0;
+        for (const Engine::Sess::Snap& sn : ss.snaps) {
+            const size_t L = (size_t) sn.pos;
+            if (L == 0 || L >= ids.size() || sn.live.size() != L || L <= best) continue;
+            if (std::equal(sn.live.begin(), sn.live.end(), ids.begin())) best = L;
+        }
+        return best;
     }
 
     /// BSTOP / BYIELD lines among the queued ones: applied now (a window is a moment away at most).
@@ -3541,7 +3658,8 @@ struct Serve {
         for (int i = 0; i < E.n_sess; ++i) {
             const Engine::Sess& ss = E.sess[(size_t) i];
             if (ss.active) continue;
-            const size_t l = match_len(ss, ids, imgs);
+            size_t l = match_len(ss, ids, imgs);
+            if (l == 0) l = snap_len(ss, ids);
             if (l > bl) { bl = l; best = i; }
             if (ss.live.empty() && free_empty < 0) free_empty = i;
             if (lru < 0 || ss.used < E.sess[(size_t) lru].used) lru = i;
@@ -3655,6 +3773,30 @@ struct Serve {
             }
         }
         E.select(s);
+        if (reuse == 0 && !adm && !geni) {   // the chat template re-rendered the turn: a snapshot of the prefix may still fit
+            for (size_t i = ss.snaps.size(); i-- > 0;) {
+                const Engine::Sess::Snap& sn = ss.snaps[i];
+                if (sn.pos <= 0 || (size_t) sn.pos >= ids.size() || sn.live.size() != (size_t) sn.pos) continue;
+                const size_t lim = std::min(sn.live.size(), ids.size());
+                size_t d = 0;
+                while (d < lim && sn.live[d] == ids[d]) ++d;
+                if (d != sn.live.size()) {   // a mismatch of one token is a different start, not a usable prefix
+                    if (E.snap_debug > 0)
+                        std::fprintf(stderr,
+                                     "strata-q36: snapshot at %zu skipped: matches %zu of %zu tokens, diverges at %zu\n",
+                                     (size_t) sn.pos, d, sn.live.size(), d);
+                    continue;
+                }
+                if (!E.snap_restore(ss, i)) {   // a broken snapshot must not hide the older ones
+                    std::fprintf(stderr, "strata-q36: snapshot at %zu could not be put back\n", (size_t) sn.pos);
+                    continue;
+                }
+                reuse = (size_t) sn.pos;
+                std::fprintf(stderr, "strata-q36: prompt snapshot: %zu of %zu tokens kept, %zu read\n", reuse,
+                             ids.size(), ids.size() - reuse);
+                break;
+            }
+        }
         if (reuse == 0) {
             E.reset();
             ss.live.clear();
@@ -3665,21 +3807,37 @@ struct Serve {
         const auto t0 = Clock::now();
         const int64_t fresh = (int64_t) (ids.size() - reuse);
         bool cancelled = false;
-        const int64_t got = E.process(ids.data() + reuse, fresh, [&](int64_t done) -> bool {
-            std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) fresh, ms_since(t0),
-                        (double) done / std::max(1e-9, ms_since(t0) / 1000.0));
+        // The chat template's own tail is rendered differently once the reply follows it, so a snapshot of the very end of the
+        // prompt rarely matches the next turn.  Reading that tail as its own chunk leaves a snapshot just before it, which the
+        // next turn does match: it then reads only the tail and the new text.
+        const int64_t tail = (E.snap_keep > 0 && !geni && fresh > 2 * (int64_t) E.snap_tail) ? (int64_t) E.snap_tail : 0;
+        const int64_t head = fresh - tail;
+        int64_t base = 0;
+        int64_t got = 0;
+        auto read_cb = [&](int64_t done) -> bool {
+            const int64_t total = base + done;
+            if (E.snap_keep > 0 && !geni) E.snap_take(ss, ids, (size_t) reuse + (size_t) total);
+            std::printf("PP %lld %lld %.0f %.1f\n", (long long) total, (long long) fresh, ms_since(t0),
+                        (double) total / std::max(1e-9, ms_since(t0) / 1000.0));
             std::fflush(stdout);
-            if (n_active > 0 && done < fresh) {
+            if (n_active > 0 && total < fresh) {
                 poll_control();
                 // the slots decoding go on between a read's chunks (the last chunk's
                 for (int w = 0; w < read_windows && n_active > 0; ++w) window();   // logits must stay for the first token)
             } else {
                 poll_control();
             }
-            if (stop.load() && done < fresh) { cancelled = true; return false; }
+            if (stop.load() && total < fresh) { cancelled = true; return false; }
             return true;
-        });
+        };
+        got = E.process(ids.data() + reuse, head, read_cb);
+        if (tail > 0 && got == head && !cancelled) {
+            if (E.snap_keep > 0 && !geni) E.snap_take(ss, ids, (size_t) reuse + (size_t) got);   // the state just before that tail
+            base = head;
+            got += E.process(ids.data() + reuse + got, tail, read_cb);
+        }
         ss.live.insert(ss.live.end(), ids.begin() + (long) reuse, ids.begin() + (long) reuse + (long) got);
+        if (E.snap_keep > 0 && !geni && !cancelled) E.snap_take(ss, ss.live, ss.live.size());   // the state the next turn extends
         ss.imgs.clear();
         bool cut = false;
         for (const ImgKey& k : ir.imgs) {
