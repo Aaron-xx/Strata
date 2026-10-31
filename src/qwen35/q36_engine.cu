@@ -59,6 +59,9 @@
 #include <tuple>
 #include <type_traits>
 #include <vector>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 namespace {
 
@@ -244,8 +247,8 @@ struct RowSel {
     const int32_t* cell = nullptr;   // device [T]
     const int32_t* slot = nullptr;   // device [T]
     const int32_t* delta = nullptr;  // device [T]
-    __half* const* kc = nullptr;     // device [n_sessions]: this layer's K / V base of each session (FP16)
-    __half* const* vc = nullptr;
+    int8_t* const* kc = nullptr;     // device [n_sessions]: this layer's K / V base of each session (8-bit + scales)
+    int8_t* const* vc = nullptr;
 };
 
 /// The attention layer's per-token preparation for T rows at positions *pos0 + t: q (from the [q | gate] pairs) and k
@@ -255,7 +258,7 @@ struct RowSel {
 /// interleaved M-RoPE position (llama.cpp's IMROPE with sections 11 / 11 / 10: pair p takes stream p % 3).
 /// grid (H + HKV, T), block 256 (HD <= 256).
 __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, const float* qw, const float* kw,
-                            float* q, float* gate, __half* kc, __half* vc, int H, int HKV, int HD, int n_rot,
+                            float* q, float* gate, int8_t* kc, int8_t* vc, int H, int HKV, int HD, int n_rot,
                             const int32_t* pos0, int ctx, float base, float eps, const int32_t* rdelta,
                             const int32_t* mtab, RowSel rs) {
     __shared__ float sh[kThreads];
@@ -290,16 +293,30 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
         q[((size_t) t * H + head) * HD + i] = v;
         gate[((size_t) t * H + head) * HD + i] = qg[((size_t) t * H + head) * 2 * HD + HD + i];
     } else {
+        // 8-bit cache: each row (one KV head's cell, HD values) gets one FP32 scale = its absmax / 127, and every value
+        // is rounded to the nearest of 255 levels.  The block's 256 threads hold the whole row when HD == 256 (this
+        // engine's k_attn_part hard-codes HD = 256), so both rows' maxima come from the block reduction it already uses.
         const int kh = head - H;
-        kc[((size_t) kh * ctx + pos) * HD + i] = __float2half(v);
-        vc[((size_t) kh * ctx + pos) * HD + i] = __float2half(vx[((size_t) t * HKV + kh) * HD + i]);
+        const float vv = vx[((size_t) t * HKV + kh) * HD + i];
+        __shared__ float kscale, vscale;
+        const float ak = block_max(fabsf(v), sh);
+        const float av = block_max(fabsf(vv), sh);
+        if (i == 0) {
+            kscale = ak > 1e-20f ? ak / 127.0f : 0.f;
+            vscale = av > 1e-20f ? av / 127.0f : 0.f;
+            ((float*) (kc + (size_t) HKV * ctx * HD))[(size_t) kh * ctx + pos] = kscale;
+            ((float*) (vc + (size_t) HKV * ctx * HD))[(size_t) kh * ctx + pos] = vscale;
+        }
+        __syncthreads();
+        kc[((size_t) kh * ctx + pos) * HD + i] = (int8_t) __float2int_rn(kscale > 0.f ? v / kscale : 0.f);
+        vc[((size_t) kh * ctx + pos) * HD + i] = (int8_t) __float2int_rn(vscale > 0.f ? vv / vscale : 0.f);
     }
 }
 
 /// Split-K attention, one block per (chunk of 256 cells, query row): query row qi = t * H + h (t from t0) sees the
 /// cells [0, *pos0 + t].  Writes the chunk's partial accumulator, max and sum; chunks past the query's cells write
 /// nothing (the merge stops before them).  grid (n_chunk, n_rows), block 256, HD == 256.
-__global__ void k_attn_part(const float* q, const __half* kc, const __half* vc, const int32_t* pos0, int t0, int H,
+__global__ void k_attn_part(const float* q, const int8_t* kc, const int8_t* vc, const int32_t* pos0, int t0, int H,
                             int HKV, int ctx, float scale, int n_chunk, float* pacc, float* pm, float* pl, RowSel rs) {
     constexpr int HD = 256;
     __shared__ float qs[HD], sc[kChunkCells], sh[kThreads];
@@ -312,20 +329,21 @@ __global__ void k_attn_part(const float* q, const __half* kc, const __half* vc, 
     }
     const int p0 = c * kChunkCells;
     if (p0 >= npos) return;
+    const float* kvsc = (const float*) (kc + (size_t) HKV * ctx * HD);
+    const float* vrow = (const float*) (vc + (size_t) HKV * ctx * HD);
     const int j = threadIdx.x;
     qs[j] = q[((size_t) t * H + h) * HD + j];
     __syncthreads();
     const int p = p0 + j;
     float s = -INFINITY;
     if (p < npos) {
-        // FP16 cache: a half2 dot, each pair's product widened and added in FP32 (the same order as before)
-        const __half2* kp = (const __half2*) (kc + ((size_t) kvh * ctx + p) * HD);
+        // 8-bit cache: the row's int8 values widened by the row's own scale, added in the same order as before
+        const int8_t* kp = kc + ((size_t) kvh * ctx + p) * HD;
+        const float krow = kvsc[(size_t) kvh * ctx + p];
         float a = 0.f;
-        for (int i = 0; i < HD / 2; ++i) {
-            const float2 f = __half22float2(kp[i]);
-            a += qs[2 * i] * f.x + qs[2 * i + 1] * f.y;
-        }
-        s = a * scale;
+        for (int i = 0; i < HD / 2; ++i)
+            a += qs[2 * i] * (float) kp[2 * i] + qs[2 * i + 1] * (float) kp[2 * i + 1];
+        s = a * (krow * scale);
     }
     const float m = block_max(s, sh);
     const float e = p < npos ? expf(s - m) : 0.f;
@@ -333,8 +351,9 @@ __global__ void k_attn_part(const float* q, const __half* kc, const __half* vc, 
     const float l = block_sum(e, sh);
     const int n = min(kChunkCells, npos - p0);
     float acc = 0.f;
-    const __half* vp = vc + ((size_t) kvh * ctx + p0) * HD + j;
-    for (int k = 0; k < n; ++k) acc += sc[k] * __half2float(vp[(size_t) k * HD]);
+    const int8_t* vp = vc + ((size_t) kvh * ctx + p0) * HD + j;
+    for (int k = 0; k < n; ++k)
+        acc += sc[k] * vrow[(size_t) kvh * ctx + p0 + k] * (float) vp[(size_t) k * HD];
     const size_t o = (size_t) row * n_chunk + c;
     pacc[o * HD + j] = acc;
     if (j == 0) {
@@ -342,6 +361,18 @@ __global__ void k_attn_part(const float* q, const __half* kc, const __half* vc, 
         pl[o] = l;
     }
 }
+/// int8 cache rows widened to FP16 for the prompt's GEMMs: dst [kvh][ctx][HD] halves, src [kvh][ctx][HD] int8 with a
+/// FP32 scale per row (the same layout k_attn_prep writes).  Grid covers HKV * P * HD elements.
+__global__ void k_kv_deint8(const int8_t* q, const float* sc, __half* d, int HKV, int ctx, int HD, int P) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t) HKV * P * HD) return;
+    const int d_ = (int) (i % HD);
+    const int64_t r = i / HD;          // kvh * P + row
+    const int row = (int) (r % P), kvh = (int) (r / P);
+    const size_t o = ((size_t) kvh * ctx + row) * HD + d_;
+    d[o] = __float2half((float) q[o] * sc[(size_t) kvh * ctx + row]);
+}
+
 /// The chunks merged, times sigmoid(gate): grid (n_rows), block HD.
 __global__ void k_attn_merge(const float* pacc, const float* pm, const float* pl, const float* gate,
                              const int32_t* pos0, int t0, int H, int n_chunk, float* out, RowSel rs) {
@@ -1154,7 +1185,8 @@ struct Engine {
     int32_t* ami;
     int n_chunk = 0, att_rows = 0;   // attention partials: att_rows query rows x n_chunk chunks
     std::vector<float*> conv, S;
-    std::vector<__half*> kc, vc;   // per layer, FP16; the MTP block's K / V at index n_layers: the CURRENT session's (select)
+    std::vector<int8_t*> kc, vc;   // per layer, 8-bit + a FP32 scale per row; the MTP block's K / V at index n_layers
+    __half* kv16 = nullptr;        // the prompt's widened rows: K at kv16, V at kv16 + HKV*ctx*HD (HKV*ctx*HD halves each)
     // verify windows (T <= kVerify): the GDN inputs of every row per layer, kept for the commit
     static constexpr int kVerify = 8;
     std::vector<float*> v_qkv, v_hc, v_alpha, v_beta;
@@ -1191,7 +1223,7 @@ struct Engine {
     // members conv / S / kc / vc / pos / hlast above are the CURRENT session's (select() swaps them).
     struct Sess {
         std::vector<float*> conv, S;
-        std::vector<__half*> kc, vc;   // FP16 KV: half the FP32 cache's bytes
+        std::vector<int8_t*> kc, vc;   // 8-bit KV: a quarter of the FP32 cache's bytes, plus HKV*ctx FP32 scales per cache
         float* hlast = nullptr;
         int64_t pos = 0;
         int32_t rdelta = 0;                 // rotary offset of the text after the last picture (see k_attn_prep)
@@ -1205,7 +1237,7 @@ struct Engine {
     uint64_t use_clock = 0;
     // device tables for batch rows: per state index (layer, then the MTP block) the session pointers
     float **d_conv_tab = nullptr, **d_S_tab = nullptr;
-    __half **d_kc_tab = nullptr, **d_vc_tab = nullptr;
+    int8_t **d_kc_tab = nullptr, **d_vc_tab = nullptr;
     int32_t *d_rcell = nullptr, *d_rslot = nullptr, *d_rdelta = nullptr;   // [kVerify] the rows' cell / session / rotary offset
     // the GDN layers run a slot's rows in sequence: per group (a slot) its session, its first row and its row count
     int32_t *d_gslot = nullptr, *d_grow0 = nullptr, *d_gcnt = nullptr;
@@ -1293,8 +1325,10 @@ struct Engine {
             if (L.attn) {
                 ss.conv.push_back(nullptr);
                 ss.S.push_back(nullptr);
-                ss.kc.push_back(dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim));
-                ss.vc.push_back(dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim));
+                ss.kc.push_back(dalloc_t<int8_t>((size_t) g.n_head_kv * ctx * g.head_dim +
+                                                 (size_t) g.n_head_kv * ctx * 4));   // the scales follow the rows
+                ss.vc.push_back(dalloc_t<int8_t>((size_t) g.n_head_kv * ctx * g.head_dim +
+                                                 (size_t) g.n_head_kv * ctx * 4));
             } else {
                 ss.conv.push_back(dalloc(C * (g.ssm_d_conv - 1)));
                 ss.S.push_back(dalloc((size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size));
@@ -1305,8 +1339,10 @@ struct Engine {
         if (m->has_mtp) {   // the MTP block's own K / V (an attention layer at index n_layers)
             ss.conv.push_back(nullptr);
             ss.S.push_back(nullptr);
-            ss.kc.push_back(dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim));
-            ss.vc.push_back(dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim));
+            ss.kc.push_back(dalloc_t<int8_t>((size_t) g.n_head_kv * ctx * g.head_dim +
+                                             (size_t) g.n_head_kv * ctx * 4));
+            ss.vc.push_back(dalloc_t<int8_t>((size_t) g.n_head_kv * ctx * g.head_dim +
+                                             (size_t) g.n_head_kv * ctx * 4));
         }
         ss.hlast = dalloc((size_t) g.n_embd);
     }
@@ -1367,6 +1403,9 @@ struct Engine {
         sk_part = dalloc((size_t) kSplitK * T * (g.n_expert + 1));
         att_p16 = dalloc_t<__half>(kAttScoreFloats);
         q16 = dalloc_t<__half>(T * g.n_head * g.head_dim);
+        // the prompt's widened KV rows: K and V, HKV * ctx * HD halves each (the int8 cache itself is a quarter of the
+        // FP16 one, so this still leaves 3/4 of the old cache's bytes to the experts)
+        kv16 = dalloc_t<__half>((size_t) 2 * g.n_head_kv * ctx * g.head_dim);
         use_mmq = MMQ::built() && std::getenv("STRATA_Q36_NO_MMQ") == nullptr;
         auto mmq_ok = [&](const Layer& L) {
             return MMQ::supported(L.L.gu_type) && MMQ::supported(L.L.d_type) && MMQ::fits(L.L.gu_type, 2 * g.n_ff) &&
@@ -1473,7 +1512,7 @@ struct Engine {
         if (n_sess > 1) {   // the batch rows' tables: per state index the session pointers, on the device
             const size_t ns = sess[0].conv.size();
             std::vector<float*> hc(ns * (size_t) n_sess), hs(hc);
-            std::vector<__half*> hk(ns * (size_t) n_sess), hv(ns * (size_t) n_sess);
+            std::vector<int8_t*> hk(ns * (size_t) n_sess), hv(ns * (size_t) n_sess);
             for (size_t li = 0; li < ns; ++li)
                 for (int s_ = 0; s_ < n_sess; ++s_) {
                     hc[li * n_sess + s_] = sess[(size_t) s_].conv[li];
@@ -1484,7 +1523,7 @@ struct Engine {
             {   // the float* tables (conv / S) and the __half* tables (kc / vc): both are 8-byte pointers
                 const std::pair<void**, std::vector<float*>*> ftabs[2] = {{(void**) &d_conv_tab, &hc},
                                                                           {(void**) &d_S_tab, &hs}};
-                const std::pair<void**, std::vector<__half*>*> htabs[2] = {{(void**) &d_kc_tab, &hk},
+                const std::pair<void**, std::vector<int8_t*>*> htabs[2] = {{(void**) &d_kc_tab, &hk},
                                                                            {(void**) &d_vc_tab, &hv}};
                 for (const auto& tb : ftabs) {
                     CK(cudaMalloc(tb.first, tb.second->size() * sizeof(float*)));
@@ -1492,8 +1531,8 @@ struct Engine {
                                   cudaMemcpyHostToDevice));
                 }
                 for (const auto& tb : htabs) {
-                    CK(cudaMalloc(tb.first, tb.second->size() * sizeof(__half*)));
-                    CK(cudaMemcpy(*tb.first, tb.second->data(), tb.second->size() * sizeof(__half*),
+                    CK(cudaMalloc(tb.first, tb.second->size() * sizeof(int8_t*)));
+                    CK(cudaMemcpy(*tb.first, tb.second->data(), tb.second->size() * sizeof(int8_t*),
                                   cudaMemcpyHostToDevice));
                 }
             }
@@ -1974,11 +2013,21 @@ struct Engine {
                     return n < 0 ? CUBLAS_GEMM_DEFAULT : (cublasGemmAlgo_t) n;
                 }();
                 k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(q, q16, (int64_t) T * H * HD);
+                // the prompt's two attention GEMMs take FP16 operands, so the 8-bit cache's live rows [0, P) are
+                // widened once here (K at kv16, V at kv16 + HKV*ctx*HD): 2 * 2 * ctx * 256 * 2 B, 100 MB at 49K, and
+                // one pass of VRAM traffic per chunk, which is 0.8 ms against the 5.5 s a chunk takes
+                __half* const k16 = kv16;
+                __half* const v16 = kv16 + (size_t) HKV * ctx * HD;
+                const int64_t nw = (int64_t) HKV * P * HD;
+                k_kv_deint8<<<grid1(nw), kThreads, 0, st>>>(kc[li], (const float*) (kc[li] + (size_t) HKV * ctx * HD),
+                                                            k16, HKV, ctx, HD, P);
+                k_kv_deint8<<<grid1(nw), kThreads, 0, st>>>(vc[li], (const float*) (vc[li] + (size_t) HKV * ctx * HD),
+                                                            v16, HKV, ctx, HD, P);
                 for (int t0 = 0; t0 < T; t0 += tq) {
                     const int nt = std::min(tq, T - t0);
                     for (int kvh = 0; kvh < HKV; ++kvh) {
-                        // the cache itself is FP16 and each KV head's [0, P) rows are contiguous: no conversion copy
-                        const __half* Kh = kc[li] + (size_t) kvh * ctx * HD;
+                        // the widened copy, each KV head's [0, P) rows contiguous
+                        const __half* Kh = k16 + (size_t) kvh * ctx * HD;
                         const __half* Qh = q16 + ((size_t) t0 * H + kvh * G) * HD;
                         float* Sh = att_s + (size_t) kvh * G * nt * ldp;
                         if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &one, Kh, CUDA_R_16F, HD,
@@ -1992,7 +2041,7 @@ struct Engine {
                     k_attn_softmax16<<<dim3(nt, H), kThreads, 0, st>>>(att_s, att_p16, ldp, nt, P, (int) p0 + t0,
                                                                        1.0f / sqrtf((float) HD));
                     for (int kvh = 0; kvh < HKV; ++kvh) {
-                        const __half* Vh = vc[li] + (size_t) kvh * ctx * HD;
+                        const __half* Vh = v16 + (size_t) kvh * ctx * HD;
                         const __half* Sh = att_p16 + (size_t) kvh * G * nt * ldp;
                         float* Oh = att + ((size_t) t0 * H + kvh * G) * HD;
                         if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, nt, P, &one, Vh, CUDA_R_16F, HD,
@@ -2678,7 +2727,7 @@ struct Engine {
         const Sess& a = sess[(size_t) src];
         Sess& b = sess[(size_t) dst];
         const size_t C = (size_t) g.ssm_conv_channels;
-        const size_t row = (size_t) ctx * g.head_dim * 2;   // FP16 cache rows
+        const size_t row = (size_t) ctx * g.head_dim;   // 8-bit cache rows (the scales follow them)
         for (size_t l = 0; l < a.conv.size(); ++l) {
             if (a.conv[l]) {
                 CK(cudaMemcpyAsync(b.conv[l], a.conv[l], C * (g.ssm_d_conv - 1) * 4, cudaMemcpyDeviceToDevice, st));
@@ -2686,9 +2735,17 @@ struct Engine {
                                    cudaMemcpyDeviceToDevice, st));
             }
             if (a.kc[l] && a.pos > 0) {
-                CK(cudaMemcpy2DAsync(b.kc[l], row, a.kc[l], row, (size_t) a.pos * g.head_dim * 2, (size_t) g.n_head_kv,
+                CK(cudaMemcpy2DAsync(b.kc[l], row, a.kc[l], row, (size_t) a.pos * g.head_dim, (size_t) g.n_head_kv,
                                      cudaMemcpyDeviceToDevice, st));
-                CK(cudaMemcpy2DAsync(b.vc[l], row, a.vc[l], row, (size_t) a.pos * g.head_dim * 2, (size_t) g.n_head_kv,
+                CK(cudaMemcpy2DAsync(b.vc[l], row, a.vc[l], row, (size_t) a.pos * g.head_dim, (size_t) g.n_head_kv,
+                                     cudaMemcpyDeviceToDevice, st));
+                // the per-row scales: [HKV][ctx] floats after the rows, one contiguous run per KV head
+                const size_t kvb = (size_t) g.n_head_kv * ctx * g.head_dim;
+                CK(cudaMemcpy2DAsync((float*) (b.kc[l] + kvb), (size_t) ctx * 4, (const float*) (a.kc[l] + kvb),
+                                     (size_t) ctx * 4, (size_t) a.pos * 4, (size_t) g.n_head_kv,
+                                     cudaMemcpyDeviceToDevice, st));
+                CK(cudaMemcpy2DAsync((float*) (b.vc[l] + kvb), (size_t) ctx * 4, (const float*) (a.vc[l] + kvb),
+                                     (size_t) ctx * 4, (size_t) a.pos * 4, (size_t) g.n_head_kv,
                                      cudaMemcpyDeviceToDevice, st));
             }
         }
@@ -2971,7 +3028,13 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     for (Layer* L : all)
         if (!mtp_only || L == &m.mtp) host += L->stride * (size_t) ne + kMmqTail;
     uint8_t* arena = nullptr;
-    bool pinned = cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
+    // STRATA_Q36_ARENA_MALLOC: keep the experts in pageable memory instead of the pinned arena.  This CPU reads a
+    // 1.7 MiB expert blob faster from malloc'd memory than from pinned memory (50.46 vs 32.81 GB/s, four threads,
+    // measured on the i5-9300HF), and decode's CPU pool does exactly that gather for every missing expert of every
+    // token; the prompt's copies to the GPU get slower, because the driver stages pageable memory through a bounce
+    // buffer.  Say it in the log, since the two trade against each other.
+    const bool pageable = std::getenv("STRATA_Q36_ARENA_MALLOC") != nullptr;
+    bool pinned = !pageable && cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
     if (!pinned) {
         (void) cudaGetLastError();
         arena = (uint8_t*) std::malloc(host);
@@ -2979,6 +3042,12 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             err = "no host memory for the experts (" + std::to_string(host >> 20) + " MiB)";
             return false;
         }
+#if defined(__linux__)
+        (void) madvise(arena, host, MADV_HUGEPAGE);
+#endif
+        std::fprintf(stderr, "strata-q36: the experts are in pageable memory (%.2f GiB%s): the CPU pool reads them "
+                     "faster, the prompt's copies to the GPU slower\n", (double) host / (1 << 30),
+                     pageable ? ", STRATA_Q36_ARENA_MALLOC" : ", pinned memory was refused");
     }
     size_t off = 0;
     E.hy.resize(all.size());
