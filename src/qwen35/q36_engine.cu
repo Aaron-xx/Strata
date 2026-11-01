@@ -1699,6 +1699,7 @@ struct Engine {
     // copy of it every turn reads the whole prompt again.  A copy taken at a chunk boundary of a read is a state the next
     // prompt can extend - restore it and read only the tail.
     int snap_keep = 0;
+    int snap_min = 1024;
     int snap_tail = 8;   // the prompt's own last tokens are read as their own chunk, so a snapshot sits just before them
     int snap_debug = 0;
     /// the bytes one snapshot of ss's state holds: the GDN layers' conv and S, and the last hidden row
@@ -1716,6 +1717,7 @@ struct Engine {
         if (snap_keep <= 0 || ntok == 0 || ntok != (size_t) pos || ntok > ids.size()) return;   // pos: the cells processed
         // The same cell boundary is taken twice (a chunk end and then the step before the prompt's tail), and the same state
         // twice is no help: a ring of duplicates evicts the older, shorter starts that a growing chat does match.
+        if (ids.size() < (size_t) snap_min) return;
         for (const Sess::Snap& sn : ss.snaps) if (sn.pos == (int64_t) ntok) return;
         const auto& g = m->g;
         const size_t nconv = (size_t) g.ssm_conv_channels * (size_t) (g.ssm_d_conv - 1);
@@ -3538,9 +3540,10 @@ struct Serve {
 
     explicit Serve(Engine& e) : E(e), slots((size_t) e.n_sess) {
         if (const char* v = std::getenv("STRATA_Q36_READ_WINDOWS")) read_windows = std::max(0, std::min(64, std::atoi(v)));
-        if (const char* v = std::getenv("STRATA_Q36_SNAP")) E.snap_keep = std::max(0, std::min(16, std::atoi(v)));
+        if (const char* v = std::getenv("STRATA_Q36_SNAP")) E.snap_keep = std::max(0, std::min(64, std::atoi(v)));
         if (const char* v = std::getenv("STRATA_Q36_SNAP_TAIL")) E.snap_tail = std::max(0, std::min(512, std::atoi(v)));
         if (const char* v = std::getenv("STRATA_Q36_SNAP_DEBUG")) E.snap_debug = std::atoi(v);
+        if (const char* v = std::getenv("STRATA_Q36_SNAP_MIN")) E.snap_min = std::max(0, std::min(1000000, std::atoi(v)));
         if (E.snap_keep > 0) {
             const size_t b = E.snap_bytes(E.sess[0]);
             std::fprintf(stderr, "strata-q36: %d prompt snapshots per session (%.0f MiB each, %.0f MiB of host memory): a "

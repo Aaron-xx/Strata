@@ -620,6 +620,15 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             kwargs.update(effort_kwargs(v))
         elif k not in ("enable_thinking", "reasoning_effort"):
             kwargs[k] = v
+    # A helper call (a session title, a one-line check) allows a few dozen tokens, and the template
+    # thinks by default: the whole budget went to the reasoning, the answer came back empty and
+    # finish_reason was length.  Unless the client asked for thinking itself, a small budget
+    # renders the prompt without it (STRATA_SERVE_THINK_MAX overrides the threshold).
+    if "enable_thinking" not in kwargs:
+        cap = req.get("max_completion_tokens", req.get("max_tokens"))
+        think_max = int(os.environ.get("STRATA_SERVE_THINK_MAX", "512"))
+        if isinstance(cap, int) and not isinstance(cap, bool) and 0 < cap <= think_max:
+            kwargs["enable_thinking"] = False
     return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 
 
