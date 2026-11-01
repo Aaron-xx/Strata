@@ -1401,7 +1401,7 @@ struct Engine {
     std::vector<int> stream_seq;   // the state indices a streamed forward visits, in order
     int stream_pos = 0;
     long long hy_cpu = 0, hy_gpu = 0, hy_swaps = 0;   // entries computed on the CPU / GPU, slot replacements
-    double hy_cpu_ms = 0;
+    double hy_cpu_ms = 0, hy_pool_ms = 0, hy_job_ms = 0;   // the CPU half: building the jobs / the pool's run
     // decode / verify rows: their routing is counted once the rows are kept (commit), so a verify window's rejected
     // drafts never move the slots; the slots follow the counts at every kRebalanceEvery-th position exactly (a
     // window never steps over one), so plain and speculative decoding see the same slot tables at every position
@@ -2559,7 +2559,10 @@ struct Engine {
         hy_cpu += n_miss;
         hy_gpu += n_ent - n_miss;
         if (n_miss == 0) return;
+        hy_job_ms += ms_since(t0);
+        const auto tp = Clock::now();
         pool->run_split_multi_native(H.fmt, jobs.data(), (int) jobs.size());
+        hy_pool_ms += ms_since(tp);
         hy_cpu_ms += ms_since(t0);
         CK(cudaMemcpyAsync(ecpu, cpu_out, (size_t) n_ent * N * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(d_miss, h_miss, (size_t) n_ent * 4, cudaMemcpyHostToDevice, st));
@@ -3058,6 +3061,7 @@ struct Engine {
         for (Hy& H : hy) std::fill(H.score.begin(), H.score.end(), 0.0);
         hy_cpu = hy_gpu = hy_swaps = 0;
         hy_cpu_ms = 0;
+        hy_pool_ms = hy_job_ms = 0;
         reset();
         std::fprintf(stderr, "strata-q36: warmed up in %.1f s (one prompt chunk, a decode step%s)\n",
                      ms_since(t0) / 1000.0, mtp_d > 0 ? ", a speculative step" : "");
@@ -4263,8 +4267,9 @@ int strata::qwen35::run(int argc, char** argv) {
             if (!E.m->hybrid) return;
             const long long n = E.hy_cpu + E.hy_gpu;
             std::fprintf(stderr, "strata-q36: hybrid experts: %lld of %lld batch entries on the GPU (%.1f%%), %lld on the "
-                         "CPU pool in %.0f ms, %lld slot replacements\n", E.hy_gpu, n, n ? 100.0 * E.hy_gpu / n : 0.0,
-                         E.hy_cpu, E.hy_cpu_ms, E.hy_swaps);
+                         "CPU pool in %.0f ms (%.0f ms in the pool call, %.0f ms making its jobs), %lld slot replacements\n",
+                         E.hy_gpu, n, n ? 100.0 * E.hy_gpu / n : 0.0, E.hy_cpu, E.hy_cpu_ms, E.hy_pool_ms, E.hy_job_ms,
+                         E.hy_swaps);
         }
     } report{E};
     E.reset();
