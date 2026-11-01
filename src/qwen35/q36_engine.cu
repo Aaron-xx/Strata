@@ -1302,7 +1302,16 @@ struct Engine {
     float* sk_part = nullptr;          // the split-K partials of the F32 projections: [kSplitK][tmax][<= 257]
     __half* att_p16 = nullptr;         // the probabilities in FP16 (kAttScoreFloats halves)
     __half* q16 = nullptr;   // the prompt attention's FP16 queries (the KV cache is FP16 itself)
-    size_t kAttScoreFloats = (size_t) 16 << 20;   // 256 MB (16 M floats when the experts' fit is close)
+    // The prompt attention's score buffer, in floats (4 B scores + 2 B probabilities each).  16 M = 64 MB, and at 44 K
+    // cells that slices the prompt into 23-row column tiles: a 23-wide tile wastes most of Turing's 64/128-wide MMA
+    // tile, so the two attention GEMMs ran at about 1 of this card's 5 TFLOPS.  The buffer is sized before the expert
+    // placement, so raising it only costs the VRAM that the staging buffer and the expert slots would have had.
+    // STRATA_Q36_ATTN_SCORE_M=N: N million floats (16 = the default, 32 = 128 MB, 64 = 256 MB).
+    size_t kAttScoreFloats = [] {
+        const char* v = std::getenv("STRATA_Q36_ATTN_SCORE_M");
+        const long m = v && v[0] ? std::atol(v) : 0;
+        return (size_t) (m > 0 ? m : 16) << 20;
+    }();
     // the prompt's MMQ experts
     bool use_mmq = false;
     std::unique_ptr<MMQ::Context> mctx;
@@ -1662,6 +1671,12 @@ struct Engine {
         CK(cudaMemGetInfo(&fr, &tot));
         std::fprintf(stderr, "strata-q36: context %d cells, prompt chunk %d%s, %.2f GiB of VRAM free\n", ctx, tmax,
                      m->has_mtp ? ", MTP block loaded" : "", (double) fr / (1 << 30));
+        {
+            const int64_t ldp = (((int64_t) ctx + 7) / 8) * 8;
+            const int64_t rows = (int64_t) kAttScoreFloats / ((int64_t) m->g.n_head * ldp);
+            std::fprintf(stderr, "strata-q36: attention scores buffer %zu floats (%.0f MB): %lld prompt rows per slice at %d cells\n",
+                         kAttScoreFloats, (double) kAttScoreFloats * 6.0 / (1 << 20), (long long) (rows > 0 ? rows : 1), ctx);
+        }
     }
 
     /// The recurrent state and the cache to a fresh sequence.
