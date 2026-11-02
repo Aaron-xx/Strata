@@ -1,0 +1,35 @@
+{
+  "arch": "qwen35moe",
+  "exe": "/home/aaron/ai/Strata/build/strata",
+  "model_name": "qwen3.6-35b-a3b-q4ks",
+  "tokenizer": "/data/strata-research/models/tokenizer",
+  "args": [
+    "--native",
+    "/data/strata-research/models/Qwen3.6-35B-A3B-UD-Q4_K_S.gguf",
+    "--max-context",
+    "65536",
+    "--prefill",
+    "1536",
+    "--mtp",
+    "0",
+    "--cpu-threads",
+    "6"
+  ],
+  "env": {
+    "STRATA_Q8_PACKED": "0",
+    "STRATA_GEMM_ALGO": "6",
+    "STRATA_ATTN_ALGO": "3",
+    "STRATA_CPU_IQ_ALL_EXACT1": "1",
+    "STRATA_Q36_SNAP": "48",
+    "STRATA_Q36_SNAP_TAIL": "8",
+    "STRATA_Q36_ATTN_SCORE_M": "32",
+    "STRATA_Q36_SNAP_DEBUG": "2"
+  },
+  "parallel": 1,
+  "port": 8000,
+  "gpu": [
+    0
+  ],
+  "host": "0.0.0.0",
+  "log": "/home/aaron/ai/Strata/strata-q4ks.log"
+}

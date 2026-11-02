@@ -4984,6 +4984,38 @@ class Service:
                         part["source"] = str(image)
         fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
+        try:
+            import os as _os
+            if _os.environ.get("STRATA_SERVE_PROMPT_DIFF"):
+                # why a growing chat re-reads the same middle tokens: compare with the previous big prompt
+                import json as _j
+                _cur = [_j.dumps(m, ensure_ascii=False, sort_keys=True) for m in messages]
+                _prev = getattr(self, "_prev_prompt", None)
+                if _prev is not None and len(ids) > 2048:
+                    _pids, _pmsgs = _prev
+                    _n, _d = min(len(ids), len(_pids)), 0
+                    while _d < _n and ids[_d] == _pids[_d]:
+                        _d += 1
+                    _mi = None
+                    for _i in range(min(len(_cur), len(_pmsgs))):
+                        if _cur[_i] != _pmsgs[_i]:
+                            _mi = _i
+                            break
+                    _line = ("[strata] prompt diff: %d of %d tokens shared with the previous request (%d); messages %d vs %d"
+                             % (_d, len(ids), len(_pids), len(_cur), len(_pmsgs)))
+                    if _mi is not None:
+                        _a, _b = _pmsgs[_mi], _cur[_mi]
+                        _k = 0
+                        while _k < min(len(_a), len(_b)) and _a[_k] == _b[_k]:
+                            _k += 1
+                        _line += ("; message %d differs at char %d (%d -> %d chars)" % (_mi, _k, len(_a), len(_b)))
+                        _line += "\n    was: ..." + _a[max(0, _k - 80):_k + 200].replace("\n", "\\n")
+                        _line += "\n    now: ..." + _b[max(0, _k - 80):_k + 200].replace("\n", "\\n")
+                    print(_line, flush=True)
+                if len(ids) > 2048:
+                    self._prev_prompt = (list(ids), _cur)
+        except Exception as _e:
+            print("[strata] prompt diff failed:", _e, flush=True)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None

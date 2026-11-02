@@ -38,6 +38,18 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
+
+namespace {
+inline double pf_now_ms() {
+    return (double) std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0;
+}
+bool g_pf_on = std::getenv("STRATA_Q36_PREFILL_TIMING") != nullptr;
+double g_pf_dense = 0, g_pf_attn = 0, g_pf_moe = 0;
+double g_pf_prep = 0, g_pf_score = 0, g_pf_soft = 0, g_pf_val = 0, g_pf_gate = 0;
+}  // namespace
+
 #include <cctype>
 #include <atomic>
 #include <chrono>
@@ -1828,8 +1840,12 @@ struct Engine {
         else quant(xin, n, T, q);
     }
     void apply(const Mat& w, const void* q, float* out, int T) {
+        const bool pf = g_pf_on && T > kGemmT;
+        if (pf) cudaStreamSynchronize(st);
+        const double pt0 = pf ? pf_now_ms() : 0.0;
         if (T > kGemmT) gemm.native((const uint16_t*) x16, w.type, w.d, out, T, w.n_out, w.n_in);
         else mmq(w, q, out, T);
+        if (pf) { cudaStreamSynchronize(st); g_pf_dense += pf_now_ms() - pt0; }
     }
     /// x [T][n] -> its q8_1 image (T contiguous columns: one vector of T * n), for every matrix that reads x.
     void quant(const float* xin, int n, int T, void* q) { K::native_quantize_q8_1(xin, q, n * T, 1, st); }
@@ -2223,6 +2239,7 @@ struct Engine {
                     const int n = std::atoi(v);
                     return n < 0 ? CUBLAS_GEMM_DEFAULT : (cublasGemmAlgo_t) n;
                 }();
+                const bool pfa = g_pf_on; double pt1 = pfa ? pf_now_ms() : 0.0;
                 k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(q, q16, (int64_t) T * H * HD);
                 // the prompt's two attention GEMMs take FP16 operands, so the 8-bit cache's live rows [0, P) are
                 // widened once here (K at kv16, V at kv16 + HKV*ctx*HD): 2 * 2 * ctx * 256 * 2 B, 100 MB at 49K, and
@@ -2234,6 +2251,7 @@ struct Engine {
                                                             k16, HKV, ctx, HD, P);
                 k_kv_deint8<<<grid1(nw), kThreads, 0, st>>>(vc[li], (const float*) (vc[li] + (size_t) HKV * ctx * HD),
                                                             v16, HKV, ctx, HD, P);
+                if (pfa) { cudaStreamSynchronize(st); const double pf_n = pf_now_ms(); g_pf_prep += pf_n - pt1; pt1 = pf_n; }
                 for (int t0 = 0; t0 < T; t0 += tq) {
                     const int nt = std::min(tq, T - t0);
                     for (int kvh = 0; kvh < HKV; ++kvh) {
@@ -2249,8 +2267,10 @@ struct Engine {
                             std::exit(1);
                         }
                     }
+                    if (pfa) { cudaStreamSynchronize(st); const double pf_n = pf_now_ms(); g_pf_score += pf_n - pt1; pt1 = pf_n; }
                     k_attn_softmax16<<<dim3(nt, H), kThreads, 0, st>>>(att_s, att_p16, ldp, nt, P, (int) p0 + t0,
                                                                        1.0f / sqrtf((float) HD));
+                    if (pfa) { cudaStreamSynchronize(st); const double pf_n = pf_now_ms(); g_pf_soft += pf_n - pt1; pt1 = pf_n; }
                     for (int kvh = 0; kvh < HKV; ++kvh) {
                         const __half* Vh = v16 + (size_t) kvh * ctx * HD;
                         const __half* Sh = att_p16 + (size_t) kvh * G * nt * ldp;
@@ -2264,7 +2284,10 @@ struct Engine {
                         }
                     }
                 }
+                if (pfa) { cudaStreamSynchronize(st); const double pf_n = pf_now_ms(); g_pf_val += pf_n - pt1; pt1 = pf_n; }
                 k_gate_mul<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(att, gate, (int64_t) T * H * HD);
+                if (pfa) { cudaStreamSynchronize(st); const double pf_n = pf_now_ms(); g_pf_gate += pf_n - pt1; pt1 = pf_n; }
+                g_pf_attn = g_pf_prep + g_pf_score + g_pf_soft + g_pf_val + g_pf_gate;
             } else {
                 // split-K over 256-cell chunks; the chunk grid covers every cell a row can see (graph mode: the whole
                 // context, past-the-end chunks return at once)
@@ -2315,6 +2338,7 @@ struct Engine {
             // sorted by expert on the device, gate+up as one [2 FF] product per expert, SwiGLU, down into rows the
             // combine reads through entry -> sorted row
             const int ne = (int) g.n_expert;
+            const bool pfm = g_pf_on; const double pt2 = pfm ? pf_now_ms() : 0.0;
             CK(cudaMemsetAsync(rcnt, 0, (size_t) ne * 4, st));
             k_route_count<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, rcnt);
             k_route_scan<<<1, 32, 0, st>>>(rcnt, ne, rbounds, rcur, rmax);
@@ -2340,6 +2364,7 @@ struct Engine {
             dn.total_rows = n_ent; dn.max_rows = maxr; dn.dst = eparts; dn.ld_dst = N;
             mctx->run(dn, st);
             if (lhy(li)) stream_done();
+            if (pfm) { cudaStreamSynchronize(st); g_pf_moe += pf_now_ms() - pt2; }
             prow = rinv;
         } else {
             group_entries(L, nullptr, T);
@@ -2366,6 +2391,13 @@ struct Engine {
         if (hy_rows) moe_hybrid_cpu(li, T);   // the CPU pool's experts (while the GPU runs the rest), merged
         // the combine, the shared expert's gate, the residual add and the next norm in one launch
         moe_end(T, prow, sy, ext ? logits_r + g.n_expert : sgate, wn, hout, ext ? (int) g.n_expert + 1 : 1);
+        if (g_pf_on && T > kGemmT && li + 1 == m->layers.size()) {
+            cudaStreamSynchronize(st);
+            std::fprintf(stderr, "strata-q36: prefill chunk %d rows: dense %.0f ms, attn %.0f ms [prep %.0f scores %.0f softmax %.0f values %.0f gate %.0f], experts %.0f ms\n",
+                         T, g_pf_dense, g_pf_attn, g_pf_prep, g_pf_score, g_pf_soft, g_pf_val, g_pf_gate, g_pf_moe);
+            g_pf_dense = g_pf_attn = g_pf_moe = 0;
+            g_pf_prep = g_pf_score = g_pf_soft = g_pf_val = g_pf_gate = 0;
+        }
     }
 
     /// The main model over T rows (device `tok`, positions p0 .. p0 + T - 1, also at *pos0): hmain gets every row's
@@ -3912,6 +3944,26 @@ struct Serve {
                 size_t d = 0;
                 while (d < lim && sn.live[d] == ids[d]) ++d;
                 if (d != sn.live.size()) {   // a mismatch of one token is a different start, not a usable prefix
+                    if (E.snap_debug >= 2 && i + 1 == ss.snaps.size()) {
+                        const size_t a = d >= 4 ? d - 4 : 0;
+                        const size_t b = std::min(ids.size(), d + 8);
+                        std::fprintf(stderr, "strata-q36:   prev[%zu..%zu):", a, b);
+                        for (size_t k = a; k < b && k < sn.live.size(); ++k) std::fprintf(stderr, " %d", sn.live[k]);
+                        std::fprintf(stderr, "\nstrata-q36:   now [%zu..%zu):", a, b);
+                        for (size_t k = a; k < b; ++k) std::fprintf(stderr, " %d", ids[k]);
+                        long ex_ids = -1, ex_live = -1;
+                        for (size_t sh = 1; sh <= 512 && ex_ids < 0; ++sh)
+                            if (d + sh + 16 <= ids.size() && d + 16 <= sn.live.size() &&
+                                std::equal(ids.begin() + d + sh, ids.begin() + d + sh + 16, sn.live.begin() + d))
+                                ex_ids = (long) sh;
+                        for (size_t sh = 1; sh <= 512 && ex_live < 0; ++sh)
+                            if (d + sh + 16 <= sn.live.size() && d + 16 <= ids.size() &&
+                                std::equal(sn.live.begin() + d + sh, sn.live.begin() + d + sh + 16, ids.begin() + d))
+                                ex_live = (long) sh;
+                        std::fprintf(stderr,
+                                     "\nstrata-q36:   resync: %ld tokens extra in this prompt, %ld extra in the snapshot; ids %zu live %zu\n",
+                                     ex_ids, ex_live, ids.size(), sn.live.size());
+                    }
                     if (E.snap_debug > 0)
                         std::fprintf(stderr,
                                      "strata-q36: snapshot at %zu skipped: matches %zu of %zu tokens, diverges at %zu\n",
