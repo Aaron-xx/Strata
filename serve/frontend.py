@@ -769,9 +769,9 @@ def param_end(text: str, final: bool = False) -> int:
     at = text.find(PARAM_END)
     while at >= 0:
         after = text[at + len(PARAM_END):].lstrip()
-        if after.startswith(("<parameter=", FUNC_END)):
+        if after.startswith(("<parameter=", FUNC_END, CALL_END)):
             return at
-        if not after or "<parameter=".startswith(after) or FUNC_END.startswith(after):
+        if not after or "<parameter=".startswith(after) or FUNC_END.startswith(after) or CALL_END.startswith(after):
             return at if final else -2
         at = text.find(PARAM_END, at + 1)
     return -1
