@@ -46,6 +46,7 @@ inline double pf_now_ms() {
                std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0;
 }
 bool g_pf_on = std::getenv("STRATA_Q36_PREFILL_TIMING") != nullptr;
+bool g_attn_merge = std::getenv("STRATA_Q36_ATTN_MERGE") != nullptr;
 double g_pf_dense = 0, g_pf_attn = 0, g_pf_moe = 0;
 double g_pf_prep = 0, g_pf_score = 0, g_pf_soft = 0, g_pf_val = 0, g_pf_gate = 0;
 }  // namespace
@@ -737,6 +738,15 @@ __global__ void k_merge_cpu(float* parts, const float* cpu, const int32_t* miss,
     const int e = blockIdx.x;
     if (!miss[e]) return;
     for (int i = threadIdx.x; i < n; i += blockDim.x) parts[(size_t) e * n + i] = cpu[(size_t) e * n + i];
+}
+/// STRATA_Q36_ATTN_MERGE: a slice's queries for the G query heads of KV head kvh, repacked so that column b*nt + jt
+/// holds row (t0 + jt) of head kvh*G + b.  That is the column order the strided batch wrote, so one GEMM of n = G*nt
+/// leaves its scores exactly where the softmax and the values GEMM already read them.  grid (nt, G), block 256.
+__global__ void k_q_merge(const __half* q16, __half* qm, int t0, int H, int kvh, int G, int nt, int HD) {
+    const int jt = blockIdx.x, b = blockIdx.y;
+    const __half* src = q16 + ((size_t) (t0 + jt) * H + (size_t) kvh * G + b) * HD;
+    __half* dst = qm + (size_t) (b * nt + jt) * HD;
+    for (int k = threadIdx.x; k < HD; k += blockDim.x) dst[k] = src[k];
 }
 /// The prompt's causal softmax: row (h, t) of S (ld floats, P cells) -> softmax(S * scale) over the cells
 /// [0, pos0 + t], 0 past them, as FP16 probabilities (S16, the same row offsets, ld halves).  grid (T, H), block 256.
@@ -1526,6 +1536,7 @@ struct Engine {
     float* sk_part = nullptr;          // the split-K partials of the F32 projections: [kSplitK][tmax][<= 257]
     __half* att_p16 = nullptr;         // the probabilities in FP16 (kAttScoreFloats halves)
     __half* q16 = nullptr;   // the prompt attention's FP16 queries (the KV cache is FP16 itself)
+    __half* qm = nullptr;    // STRATA_Q36_ATTN_MERGE: a slice's queries b-major, one GEMM over the G heads
     // The prompt attention's score buffer, in floats (4 B scores + 2 B probabilities each).  16 M = 64 MB, and at 44 K
     // cells that slices the prompt into 23-row column tiles: a 23-wide tile wastes most of Turing's 64/128-wide MMA
     // tile, so the two attention GEMMs ran at about 1 of this card's 5 TFLOPS.  The buffer is sized before the expert
@@ -1739,6 +1750,8 @@ struct Engine {
         sk_part = dalloc((size_t) kSplitK * T * (g.n_expert + 1));
         att_p16 = dalloc_t<__half>(kAttScoreFloats);
         q16 = dalloc_t<__half>(T * g.n_head * g.head_dim);
+        if (g_attn_merge)
+            qm = dalloc_t<__half>((size_t) (g.n_head / std::max(1, (int) g.n_head_kv)) * T * g.head_dim);
         // the prompt's widened KV rows: K and V, HKV * ctx * HD halves each (the int8 cache itself is a quarter of the
         // FP16 one, so this still leaves 3/4 of the old cache's bytes to the experts)
         kv16 = dalloc_t<__half>((size_t) 2 * g.n_head_kv * ctx * g.head_dim);
@@ -2502,12 +2515,25 @@ struct Engine {
                     for (int kvh = 0; kvh < HKV; ++kvh) {
                         // the widened copy, each KV head's [0, P) rows contiguous
                         const __half* Kh = k16 + (size_t) kvh * ctx * HD;
-                        const __half* Qh = q16 + ((size_t) t0 * H + kvh * G) * HD;
                         float* Sh = att_s + (size_t) kvh * G * nt * ldp;
-                        if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &one, Kh, CUDA_R_16F, HD,
-                                                       0, Qh, CUDA_R_16F, H * HD, HD, &zero, Sh, CUDA_R_32F, ldp,
-                                                       (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, attn_algo) !=
-                            CUBLAS_STATUS_SUCCESS) {
+                        // STRATA_Q36_ATTN_MERGE: the G query heads of a KV head share one K, but as a strided batch of
+                        // n = nt cuBLAS reads K once per head and runs a band a tenth of a tile wide.  Repacked b-major,
+                        // one GEMM of n = G*nt reads K once and its columns land where the strided batch put them.
+                        cublasStatus_t gst;
+                        if (g_attn_merge) {
+                            k_q_merge<<<dim3(nt, G), kThreads, 0, st>>>(q16, qm, t0, H, kvh, G, nt, HD);
+                            gst = cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt * G, HD, &one, Kh,
+                                                             CUDA_R_16F, HD, 0, qm, CUDA_R_16F, HD, HD, &zero, Sh,
+                                                             CUDA_R_32F, ldp, (long long) nt * G * ldp, 1,
+                                                             CUBLAS_COMPUTE_32F, attn_algo);
+                        } else {
+                            const __half* Qh = q16 + ((size_t) t0 * H + kvh * G) * HD;
+                            gst = cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &one, Kh,
+                                                             CUDA_R_16F, HD, 0, Qh, CUDA_R_16F, H * HD, HD, &zero, Sh,
+                                                             CUDA_R_32F, ldp, (long long) nt * ldp, G,
+                                                             CUBLAS_COMPUTE_32F, attn_algo);
+                        }
+                        if (gst != CUBLAS_STATUS_SUCCESS) {
                             std::fprintf(stderr, "strata-q36: attention scores GEMM failed\n");
                             std::exit(1);
                         }
