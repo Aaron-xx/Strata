@@ -56,9 +56,13 @@ struct Case {
     int64_t rows, cols;
 };
 
+// STRATA_BENCH_E: how many experts one launch covers (the engine launches all 256 of a layer).
+// STRATA_BENCH_TOTAL: when set, the T rows are spread over the E experts at random (a multinomial, the engine's
+// routing), and R becomes only the largest count any expert sees.  Without it every expert gets exactly R.
 double run_case(const Case& c, int R, std::mt19937& rng, float* ms_out) {
-    constexpr int E = 16;
-    const int T = E * R;
+    static const int E = [] { const char* v = std::getenv("STRATA_BENCH_E"); return v && v[0] ? std::atoi(v) : 16; }();
+    static const int total = [] { const char* v = std::getenv("STRATA_BENCH_TOTAL"); return v && v[0] ? std::atoi(v) : 0; }();
+    const int T = total > 0 ? total : E * R;
     const size_t per = mmq::matrix_bytes(c.t, c.rows, c.cols);
     std::vector<uint8_t> w = weights(c.t, c.rows, c.cols, E, rng);
     std::vector<float> x((size_t) T * c.cols);
@@ -66,7 +70,18 @@ double run_case(const Case& c, int R, std::mt19937& rng, float* ms_out) {
     std::uniform_real_distribution<float> mag(0.1f, 10.f);
     for (int t = 0; t < T; ++t) { const float m = mag(rng); for (int64_t k = 0; k < c.cols; ++k) x[(size_t) t * c.cols + k] = nd(rng) * m; }
     std::vector<int32_t> bounds(E + 1);
-    for (int e = 0; e <= E; ++e) bounds[e] = e * R;
+    if (total > 0) {
+        std::vector<int> cnt(E, 0);
+        std::uniform_int_distribution<int> pick(0, E - 1);
+        for (int t = 0; t < T; ++t) cnt[pick(rng)]++;
+        int acc = 0, mx = 0;
+        bounds[0] = 0;
+        for (int e = 0; e < E; ++e) { acc += cnt[e]; bounds[e + 1] = acc; if (cnt[e] > mx) mx = cnt[e]; }
+        R = mx;
+        std::printf("  [E=%d total=%d rows, busiest expert %d rows]\n", E, T, R);
+    } else {
+        for (int e = 0; e <= E; ++e) bounds[e] = e * R;
+    }
 
     uint8_t* dw; float *dx, *dd, *dys; void* dq; int32_t *dids, *db;
     ck(cudaMalloc(&dw, w.size()), "w"); ck(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice), "w");
@@ -112,7 +127,10 @@ int main(int argc, char** argv) {
     const char* mode = std::getenv("STRATA_PREFILL_NVFP4");
     std::printf("mmq_expert_bench: mode %s (FP4 activations: %s), 16 experts a launch, medians of 25\n",
                 mode ? mode : "w4a8", mmq::fp4_activations(GGML_TYPE_NVFP4) ? "yes" : "no");
-    const Case cases[] = {{"nvfp4 gate/up", GGML_TYPE_NVFP4, 1280, 2560},
+    // the qwen3.6-35B-A3B UD-Q4_K_S shapes the engine actually launches (N = 2048, FF = 512)
+    const Case cases[] = {{"q4_k gate/up", GGML_TYPE_Q4_K, 1024, 2048},
+                          {"q4_k down", GGML_TYPE_Q4_K, 2048, 512},
+                          {"nvfp4 gate/up", GGML_TYPE_NVFP4, 1280, 2560},
                           {"nvfp4 down", GGML_TYPE_NVFP4, 2560, 640},
                           {"q8_0 down", GGML_TYPE_Q8_0, 2560, 640},
                           {"iq3_s gate/up", GGML_TYPE_IQ3_S, 1280, 2560},

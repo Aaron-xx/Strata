@@ -49,6 +49,8 @@ bool g_pf_on = std::getenv("STRATA_Q36_PREFILL_TIMING") != nullptr;
 bool g_attn_merge = std::getenv("STRATA_Q36_ATTN_MERGE") != nullptr;
 double g_pf_dense = 0, g_pf_attn = 0, g_pf_moe = 0;
 double g_pf_prep = 0, g_pf_score = 0, g_pf_soft = 0, g_pf_val = 0, g_pf_gate = 0;
+double g_pf_moe_q = 0, g_pf_moe_gu = 0, g_pf_moe_dn = 0;
+double g_pf_copy = 0, g_pf_moe_gpu = 0;   // experts: the wait for the staged copy, and the MMQ itself
 }  // namespace
 
 #include <cctype>
@@ -2623,13 +2625,17 @@ struct Engine {
             if (lhy(li))
                 for (int x = 0; x < ne; ++x) hy[li].score[(size_t) x] += h_cnt[li * g.n_expert + x];
             const int64_t maxr = hpin[10];
+            double pt3 = pfm ? pf_now_ms() : 0.0;
             const uint8_t* wbase = lhy(li) ? stream_take((int) li) : L.blobs;
+            if (pfm && lhy(li)) { cudaStreamSynchronize(st); g_pf_copy += pf_now_ms() - pt3; pt3 = pf_now_ms(); }
             MMQ::quantize(h, ent_tok, mq_x, L.L.gu_type, N, N, n_ent, st);
+            if (pfm) { cudaStreamSynchronize(st); const double pq = pf_now_ms(); g_pf_moe_q += pq - pt3; pt3 = pq; }
             MMQ::Product gu;
             gu.w = wbase; gu.type = L.L.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.expert_bytes = L.stride;
             gu.n = ne; gu.xq = mq_x; gu.bounds = rbounds; gu.ids = ident; gu.total_rows = n_ent; gu.max_rows = maxr;
             gu.dst = mq_gu; gu.ld_dst = 2 * FF;
             mctx->run(gu, st);
+            if (pfm) { cudaStreamSynchronize(st); const double pg = pf_now_ms(); g_pf_moe_gu += pg - pt3; pt3 = pg; }
             MMQ::swiglu(mq_gu, mq_h, n_ent, FF, false, st);
             MMQ::quantize(mq_h, nullptr, mq_hq, L.L.d_type, FF, FF, n_ent, st);
             MMQ::Product dn;
@@ -2637,8 +2643,9 @@ struct Engine {
             dn.expert_bytes = L.stride; dn.n = ne; dn.xq = mq_hq; dn.bounds = rbounds; dn.ids = ident;
             dn.total_rows = n_ent; dn.max_rows = maxr; dn.dst = eparts; dn.ld_dst = N;
             mctx->run(dn, st);
+            if (pfm) { cudaStreamSynchronize(st); const double pd = pf_now_ms(); g_pf_moe_dn += pd - pt3; pt3 = pd; }
             if (lhy(li)) stream_done();
-            if (pfm) { cudaStreamSynchronize(st); g_pf_moe += pf_now_ms() - pt2; }
+            if (pfm) { cudaStreamSynchronize(st); const double pe = pf_now_ms(); g_pf_moe_gpu += pe - pt3; g_pf_moe += pe - pt2; }
             prow = rinv;
         } else {
             group_entries(L, nullptr, T);
@@ -2667,10 +2674,13 @@ struct Engine {
         moe_end(T, prow, sy, ext ? logits_r + g.n_expert : sgate, wn, hout, ext ? (int) g.n_expert + 1 : 1);
         if (g_pf_on && T > kGemmT && li + 1 == m->layers.size()) {
             cudaStreamSynchronize(st);
-            std::fprintf(stderr, "strata-q36: prefill chunk %d rows: dense %.0f ms, attn %.0f ms [prep %.0f scores %.0f softmax %.0f values %.0f gate %.0f], experts %.0f ms\n",
-                         T, g_pf_dense, g_pf_attn, g_pf_prep, g_pf_score, g_pf_soft, g_pf_val, g_pf_gate, g_pf_moe);
+            std::fprintf(stderr, "strata-q36: prefill chunk %d rows: dense %.0f ms, attn %.0f ms [prep %.0f scores %.0f softmax %.0f values %.0f gate %.0f], experts %.0f ms [staged copy wait %.0f, mmq %.0f: quant %.0f gu %.0f dn %.0f]\n",
+                         T, g_pf_dense, g_pf_attn, g_pf_prep, g_pf_score, g_pf_soft, g_pf_val, g_pf_gate, g_pf_moe, g_pf_copy, g_pf_moe_gpu,
+                         g_pf_moe_q, g_pf_moe_gu, g_pf_moe_dn);
             g_pf_dense = g_pf_attn = g_pf_moe = 0;
             g_pf_prep = g_pf_score = g_pf_soft = g_pf_val = g_pf_gate = 0;
+            g_pf_copy = g_pf_moe_gpu = 0;
+            g_pf_moe_q = g_pf_moe_gu = g_pf_moe_dn = 0;
         }
     }
 
