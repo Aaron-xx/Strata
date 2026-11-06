@@ -70,7 +70,24 @@ double run_case(const Case& c, int R, std::mt19937& rng, float* ms_out) {
     std::uniform_real_distribution<float> mag(0.1f, 10.f);
     for (int t = 0; t < T; ++t) { const float m = mag(rng); for (int64_t k = 0; k < c.cols; ++k) x[(size_t) t * c.cols + k] = nd(rng) * m; }
     std::vector<int32_t> bounds(E + 1);
-    if (total > 0) {
+    std::vector<int> cntv(E, 0);   // rows each expert gets: the per-expert launch's max_rows
+    // STRATA_BENCH_MAXR: the engine's real routing is far more skewed than a multinomial - one expert of a layer
+    // can take a tenth of the chunk's entries, and the launch grid is laid for that expert's row count.  Give
+    // expert 0 exactly this many rows and spread the rest evenly, so the grid's ntx is the engine's while the
+    // total work stays the same: the A/B for "does the maxr grid cost anything".
+    static const int forced = [] { const char* v = std::getenv("STRATA_BENCH_MAXR"); return v && v[0] ? std::atoi(v) : 0; }();
+    if (forced > 0 && total > forced) {
+        int acc = 0;
+        bounds[0] = 0;
+        for (int e = 0; e < E; ++e) {
+            const int c = e == 0 ? forced : (total - forced) / (E - 1) + (e <= (total - forced) % (E - 1) ? 1 : 0);
+            acc += c;
+            bounds[e + 1] = acc;
+        }
+        R = forced;
+        for (int e = 0; e < E; ++e) cntv[e] = bounds[e + 1] - bounds[e];
+        std::printf("  [E=%d total=%d rows, FORCED maxr %d rows on expert 0]\n", E, T, R);
+    } else if (total > 0) {
         std::vector<int> cnt(E, 0);
         std::uniform_int_distribution<int> pick(0, E - 1);
         for (int t = 0; t < T; ++t) cnt[pick(rng)]++;
@@ -78,9 +95,11 @@ double run_case(const Case& c, int R, std::mt19937& rng, float* ms_out) {
         bounds[0] = 0;
         for (int e = 0; e < E; ++e) { acc += cnt[e]; bounds[e + 1] = acc; if (cnt[e] > mx) mx = cnt[e]; }
         R = mx;
+        cntv = cnt;
         std::printf("  [E=%d total=%d rows, busiest expert %d rows]\n", E, T, R);
     } else {
         for (int e = 0; e <= E; ++e) bounds[e] = e * R;
+        cntv.assign(E, R);
     }
 
     uint8_t* dw; float *dx, *dd, *dys; void* dq; int32_t *dids, *db;
@@ -101,10 +120,32 @@ double run_case(const Case& c, int R, std::mt19937& rng, float* ms_out) {
     p.y_scale = mmq::fp4_activations(c.t) ? dys : nullptr;
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0); cudaEventCreate(&e1);
+    // STRATA_BENCH_SPLIT: one launch per expert (n=1, that expert's own row count as the grid's max_rows).
+    // The wide launch pays for ceil(maxr/J) tile columns on every one of the E experts; this pays only
+    // ceil(cnt_e/J) - at the price of E launches.
+    static const int split = [] { const char* v = std::getenv("STRATA_BENCH_SPLIT"); return v && v[0] ? std::atoi(v) : 0; }();
+    static const int grp = [] { const char* v = std::getenv("STRATA_BENCH_GRP"); return v && v[0] ? std::atoi(v) : 1; }();
+    if (split) std::printf("  [split: %d launches a product, %d experts each]\n", (E + grp - 1) / grp, grp);
     std::vector<float> ts;
     for (int i = 0; i < 28; ++i) {
         cudaEventRecord(e0);
-        ctx.run(p, nullptr);
+        if (split) {
+            for (int e0 = 0; e0 < E; e0 += grp) {
+                const int e1 = std::min(E, e0 + grp);
+                int64_t mx = 0, tot = 0;
+                for (int e = e0; e < e1; ++e) { if (cntv[e] > mx) mx = cntv[e]; tot += cntv[e]; }
+                if (tot <= 0) continue;
+                mmq::Product q = p;
+                q.w = dw + (size_t) e0 * per;
+                q.bounds = db + e0;
+                q.n = e1 - e0;
+                q.total_rows = tot;
+                q.max_rows = mx;
+                ctx.run(q, nullptr);
+            }
+        } else {
+            ctx.run(p, nullptr);
+        }
         cudaEventRecord(e1);
         ck(cudaEventSynchronize(e1), "run");
         float ms; cudaEventElapsedTime(&ms, e0, e1);
@@ -112,6 +153,38 @@ double run_case(const Case& c, int R, std::mt19937& rng, float* ms_out) {
     }
     std::sort(ts.begin(), ts.end());
     const float ms = ts[ts.size() / 2];
+    // STRATA_BENCH_CHECK: the split launch must produce the same rows as the wide one.  Runs both once into
+    // separate buffers and reports the largest absolute difference (and the largest value, for scale).
+    static const int check = [] { const char* v = std::getenv("STRATA_BENCH_CHECK"); return v && v[0] ? std::atoi(v) : 0; }();
+    if (check && split) {
+        const size_t nd = (size_t) T * c.rows;
+        float* da; float* db2;
+        ck(cudaMalloc(&da, nd * 4), "da"); ck(cudaMalloc(&db2, nd * 4), "db");
+        ck(cudaMemset(da, 0, nd * 4), "da0"); ck(cudaMemset(db2, 0, nd * 4), "db0");
+        mmq::Product q0 = p; q0.dst = da;
+        ctx.run(q0, nullptr);
+        for (int e0 = 0; e0 < E; e0 += grp) {
+            const int e1 = std::min(E, e0 + grp);
+            int64_t mx = 0, tot = 0;
+            for (int e = e0; e < e1; ++e) { if (cntv[e] > mx) mx = cntv[e]; tot += cntv[e]; }
+            if (tot <= 0) continue;
+            mmq::Product q = p; q.w = dw + (size_t) e0 * per; q.bounds = db + e0; q.n = e1 - e0;
+            q.total_rows = tot; q.max_rows = mx; q.dst = db2;
+            ctx.run(q, nullptr);
+        }
+        ck(cudaDeviceSynchronize(), "check");
+        std::vector<float> ha(nd), hb(nd);
+        ck(cudaMemcpy(ha.data(), da, nd * 4, cudaMemcpyDeviceToHost), "ha");
+        ck(cudaMemcpy(hb.data(), db2, nd * 4, cudaMemcpyDeviceToHost), "hb");
+        double mx = 0, scale = 0;
+        for (size_t i = 0; i < nd; ++i) {
+            const double d = std::fabs((double) ha[i] - (double) hb[i]);
+            if (d > mx) mx = d;
+            if (std::fabs((double) ha[i]) > scale) scale = std::fabs((double) ha[i]);
+        }
+        std::printf("  [check: wide vs split, max |diff| = %.6g, max |value| = %.6g]\n", mx, scale);
+        cudaFree(da); cudaFree(db2);
+    }
     if (ms_out) *ms_out = ms;
     cudaFree(dw); cudaFree(dx); cudaFree(dq); cudaFree(dys); cudaFree(dd); cudaFree(dids); cudaFree(db);
     cudaEventDestroy(e0); cudaEventDestroy(e1);

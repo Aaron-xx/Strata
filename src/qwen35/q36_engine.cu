@@ -46,11 +46,22 @@ inline double pf_now_ms() {
                std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0;
 }
 bool g_pf_on = std::getenv("STRATA_Q36_PREFILL_TIMING") != nullptr;
+// the prompt path's MMQ launch covers this many experts of a layer (the launch grid is laid for the busiest of
+// them); 1 = one launch per expert, 0 or a value >= the expert count = one launch for the layer.
+// Default 1: measured on the 6 GB card (ctx 98304, chunk 1280, Q4_K_S), a layer-wide launch reads 231 tok/s,
+// 16 experts a launch 270, 8 279, 4 298, 2 317, one expert a launch 366 (+58%), decode unchanged at 30-31.
+int g_mmq_grp = [] {
+    const char* v = std::getenv("STRATA_Q36_MMQ_GROUP");
+    const int n = v && v[0] ? std::atoi(v) : 1;
+    return n <= 0 ? 4096 : n;
+}();
 bool g_attn_merge = std::getenv("STRATA_Q36_ATTN_MERGE") != nullptr;
 double g_pf_dense = 0, g_pf_attn = 0, g_pf_moe = 0;
 double g_pf_prep = 0, g_pf_score = 0, g_pf_soft = 0, g_pf_val = 0, g_pf_gate = 0;
 double g_pf_moe_q = 0, g_pf_moe_gu = 0, g_pf_moe_dn = 0;
 double g_pf_copy = 0, g_pf_moe_gpu = 0;   // experts: the wait for the staged copy, and the MMQ itself
+double g_pf_maxr = 0, g_pf_rows = 0;   // the routing's shape: the launch grid's rows (maxr) and the entries
+int g_pf_layers = 0, g_pf_hot = 0;     // layers timed, and experts whose count exceeds the mean
 }  // namespace
 
 #include <cctype>
@@ -2614,35 +2625,65 @@ struct Engine {
             // sorted by expert on the device, gate+up as one [2 FF] product per expert, SwiGLU, down into rows the
             // combine reads through entry -> sorted row
             const int ne = (int) g.n_expert;
+            const int mmq_grp = g_mmq_grp;
             const bool pfm = g_pf_on; const double pt2 = pfm ? pf_now_ms() : 0.0;
             CK(cudaMemsetAsync(rcnt, 0, (size_t) ne * 4, st));
             k_route_count<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, rcnt);
             k_route_scan<<<1, 32, 0, st>>>(rcnt, ne, rbounds, rcur, rmax);
             k_route_scatter<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, Kp, rcur, ent_dst, ent_tok, rinv);
             CK(cudaMemcpyAsync(hpin + 10, rmax, 4, cudaMemcpyDeviceToHost, st));
-            if (lhy(li)) CK(cudaMemcpyAsync(h_cnt + li * g.n_expert, rcnt, (size_t) ne * 4, cudaMemcpyDeviceToHost, st));
+            // the counts of this layer's experts: the per-group launches below are laid for the busiest expert of
+            // their group, which needs the counts on the host (1 KiB a layer)
+            CK(cudaMemcpyAsync(h_cnt + li * g.n_expert, rcnt, (size_t) ne * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
             if (lhy(li))
                 for (int x = 0; x < ne; ++x) hy[li].score[(size_t) x] += h_cnt[li * g.n_expert + x];
             const int64_t maxr = hpin[10];
+            if (pfm) { g_pf_maxr += (double) maxr; g_pf_rows += (double) n_ent; ++g_pf_layers; }
             double pt3 = pfm ? pf_now_ms() : 0.0;
             const uint8_t* wbase = lhy(li) ? stream_take((int) li) : L.blobs;
             if (pfm && lhy(li)) { cudaStreamSynchronize(st); g_pf_copy += pf_now_ms() - pt3; pt3 = pf_now_ms(); }
             MMQ::quantize(h, ent_tok, mq_x, L.L.gu_type, N, N, n_ent, st);
             if (pfm) { cudaStreamSynchronize(st); const double pq = pf_now_ms(); g_pf_moe_q += pq - pt3; pt3 = pq; }
-            MMQ::Product gu;
-            gu.w = wbase; gu.type = L.L.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.expert_bytes = L.stride;
-            gu.n = ne; gu.xq = mq_x; gu.bounds = rbounds; gu.ids = ident; gu.total_rows = n_ent; gu.max_rows = maxr;
-            gu.dst = mq_gu; gu.ld_dst = 2 * FF;
-            mctx->run(gu, st);
+            // One launch for a group of mmq_grp experts, not for the whole layer: the launch grid is laid for the
+            // busiest expert's row count, and one expert of a layer can take a tenth of the chunk, so a layer-wide
+            // launch pays that expert's tile columns on all 256 experts (measured on the 6 GB card: gate/up 61.2 ms
+            // a layer-wide launch, 24.1 ms as 16 groups of 16, same rows).  STRATA_Q36_MMQ_GROUP=1 restores the
+            // one-launch-per-layer path.
+            for (int e0 = 0; e0 < ne; e0 += mmq_grp) {
+                const int e1 = std::min(ne, e0 + mmq_grp);
+                int64_t gmax = 0, gtot = 0;
+                for (int e = e0; e < e1; ++e) {
+                    const int64_t c = h_cnt[li * g.n_expert + e];
+                    if (c > gmax) gmax = c;
+                    gtot += c;
+                }
+                if (gtot <= 0) continue;
+                MMQ::Product gu;
+                gu.w = wbase + (size_t) e0 * L.stride; gu.type = L.L.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N;
+                gu.expert_bytes = L.stride; gu.n = e1 - e0; gu.xq = mq_x; gu.bounds = rbounds + e0; gu.ids = ident;
+                gu.total_rows = gtot; gu.max_rows = gmax; gu.dst = mq_gu; gu.ld_dst = 2 * FF;
+                mctx->run(gu, st);
+            }
             if (pfm) { cudaStreamSynchronize(st); const double pg = pf_now_ms(); g_pf_moe_gu += pg - pt3; pt3 = pg; }
             MMQ::swiglu(mq_gu, mq_h, n_ent, FF, false, st);
             MMQ::quantize(mq_h, nullptr, mq_hq, L.L.d_type, FF, FF, n_ent, st);
-            MMQ::Product dn;
-            dn.w = wbase + L.L.down_off; dn.type = L.L.d_type; dn.w_rows = N; dn.w_cols = FF;
-            dn.expert_bytes = L.stride; dn.n = ne; dn.xq = mq_hq; dn.bounds = rbounds; dn.ids = ident;
-            dn.total_rows = n_ent; dn.max_rows = maxr; dn.dst = eparts; dn.ld_dst = N;
-            mctx->run(dn, st);
+            for (int e0 = 0; e0 < ne; e0 += mmq_grp) {
+                const int e1 = std::min(ne, e0 + mmq_grp);
+                int64_t gmax = 0, gtot = 0;
+                for (int e = e0; e < e1; ++e) {
+                    const int64_t c = h_cnt[li * g.n_expert + e];
+                    if (c > gmax) gmax = c;
+                    gtot += c;
+                }
+                if (gtot <= 0) continue;
+                MMQ::Product dn;
+                dn.w = wbase + L.L.down_off + (size_t) e0 * L.stride; dn.type = L.L.d_type; dn.w_rows = N;
+                dn.w_cols = FF; dn.expert_bytes = L.stride; dn.n = e1 - e0; dn.xq = mq_hq;
+                dn.bounds = rbounds + e0; dn.ids = ident; dn.total_rows = gtot; dn.max_rows = gmax;
+                dn.dst = eparts; dn.ld_dst = N;
+                mctx->run(dn, st);
+            }
             if (pfm) { cudaStreamSynchronize(st); const double pd = pf_now_ms(); g_pf_moe_dn += pd - pt3; pt3 = pd; }
             if (lhy(li)) stream_done();
             if (pfm) { cudaStreamSynchronize(st); const double pe = pf_now_ms(); g_pf_moe_gpu += pe - pt3; g_pf_moe += pe - pt2; }
@@ -2677,6 +2718,11 @@ struct Engine {
             std::fprintf(stderr, "strata-q36: prefill chunk %d rows: dense %.0f ms, attn %.0f ms [prep %.0f scores %.0f softmax %.0f values %.0f gate %.0f], experts %.0f ms [staged copy wait %.0f, mmq %.0f: quant %.0f gu %.0f dn %.0f]\n",
                          T, g_pf_dense, g_pf_attn, g_pf_prep, g_pf_score, g_pf_soft, g_pf_val, g_pf_gate, g_pf_moe, g_pf_copy, g_pf_moe_gpu,
                          g_pf_moe_q, g_pf_moe_gu, g_pf_moe_dn);
+            std::fprintf(stderr, "strata-q36:   routing %d layers: mean %.1f rows/expert, grid rows (maxr) %.1f per layer, %.2fx the mean\n",
+                         g_pf_layers, g_pf_layers ? g_pf_rows / g_pf_layers / 256.0 : 0.0,
+                         g_pf_layers ? g_pf_maxr / g_pf_layers : 0.0,
+                         (g_pf_layers && g_pf_rows > 0) ? g_pf_maxr / g_pf_rows * 256.0 : 0.0);
+            g_pf_maxr = g_pf_rows = 0; g_pf_layers = 0;
             g_pf_dense = g_pf_attn = g_pf_moe = 0;
             g_pf_prep = g_pf_score = g_pf_soft = g_pf_val = g_pf_gate = 0;
             g_pf_copy = g_pf_moe_gpu = 0;
