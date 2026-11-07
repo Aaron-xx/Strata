@@ -2734,6 +2734,11 @@ struct Engine {
             if (pfm && lhy(li)) { cudaStreamSynchronize(st); g_pf_copy += pf_now_ms() - pt3; pt3 = pf_now_ms(); }
             MMQ::quantize(h, ent_tok, mq_x, L.L.gu_type, N, N, n_ent, st);
             if (pfm) { cudaStreamSynchronize(st); const double pq = pf_now_ms(); g_pf_moe_q += pq - pt3; pt3 = pq; }
+            // Only the grid width (max_rows), the expert window (n, bounds) and the weight base are group-scoped.
+            // total_rows stays n_ent: mq_x/mq_hq are quantized once for the whole layer, so the q8 K-blocks
+            // are n_ent rows apart (MMQ's ncols_y) and dst rows are the global sorted indices (ids=ident).
+            // Passing gtot here made every K-block but the first read another expert's activation, which
+            // corrupted every prompt whenever a layer was split into more than one MMQ launch.
             // One launch for a group of mmq_grp experts, not for the whole layer: the launch grid is laid for the
             // busiest expert's row count, and one expert of a layer can take a tenth of the chunk, so a layer-wide
             // launch pays that expert's tile columns on all 256 experts (measured on the 6 GB card: gate/up 61.2 ms
@@ -2751,7 +2756,7 @@ struct Engine {
                 MMQ::Product gu;
                 gu.w = wbase + (size_t) e0 * L.stride; gu.type = L.L.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N;
                 gu.expert_bytes = L.stride; gu.n = e1 - e0; gu.xq = mq_x; gu.bounds = rbounds + e0; gu.ids = ident;
-                gu.total_rows = gtot; gu.max_rows = gmax; gu.dst = mq_gu; gu.ld_dst = 2 * FF;
+                gu.total_rows = n_ent; gu.max_rows = gmax; gu.dst = mq_gu; gu.ld_dst = 2 * FF;
                 mctx->run(gu, st);
             }
             if (pfm) { cudaStreamSynchronize(st); const double pg = pf_now_ms(); g_pf_moe_gu += pg - pt3; pt3 = pg; }
@@ -2769,7 +2774,7 @@ struct Engine {
                 MMQ::Product dn;
                 dn.w = wbase + L.L.down_off + (size_t) e0 * L.stride; dn.type = L.L.d_type; dn.w_rows = N;
                 dn.w_cols = FF; dn.expert_bytes = L.stride; dn.n = e1 - e0; dn.xq = mq_hq;
-                dn.bounds = rbounds + e0; dn.ids = ident; dn.total_rows = gtot; dn.max_rows = gmax;
+                dn.bounds = rbounds + e0; dn.ids = ident; dn.total_rows = n_ent; dn.max_rows = gmax;
                 dn.dst = eparts; dn.ld_dst = N;
                 mctx->run(dn, st);
             }
