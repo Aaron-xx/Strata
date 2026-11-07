@@ -5,11 +5,11 @@
   "tokenizer": "/data/strata-research/models/tokenizer",
   "args": [
     "--native",
-    "/data/strata-research/models/Qwen3.6-35B-A3B-UD-Q4_K_S.gguf",
+    "/home/aaron/models/Qwen3.6-35B-A3B-UD-Q4_K_S.gguf",
     "--max-context",
     "98304",
     "--prefill",
-    "1280",
+    "1536",
     "--mtp",
     "0",
     "--cpu-threads",
@@ -24,7 +24,8 @@
     "STRATA_CPU_IQ_ALL_EXACT1": "1",
     "STRATA_Q36_SNAP": "48",
     "STRATA_Q36_SNAP_TAIL": "8",
-    "STRATA_Q36_ATTN_MERGE": "1"
+    "STRATA_Q36_ATTN_MERGE": "1",
+    "STRATA_Q36_ATTN_KSEQ": "1"
   },
   "parallel": 1,
   "port": 8000,

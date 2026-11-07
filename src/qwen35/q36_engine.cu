@@ -56,6 +56,13 @@ int g_mmq_grp = [] {
     return n <= 0 ? 4096 : n;
 }();
 bool g_attn_merge = std::getenv("STRATA_Q36_ATTN_MERGE") != nullptr;
+// STRATA_Q36_ATTN_KSEQ (default on): a prompt chunk's scores slide one KV head at a time, so the score buffer holds
+// G*nt rows instead of H*nt and a slice carries twice the query rows.  STRATA_Q36_ATTN_KSEQ=0 keeps the both-head
+// slices (the older layout), for A/B.
+bool g_attn_kseq = [] {
+    const char* v = std::getenv("STRATA_Q36_ATTN_KSEQ");
+    return !(v && v[0] == '0');
+}();
 double g_pf_dense = 0, g_pf_attn = 0, g_pf_moe = 0;
 double g_pf_prep = 0, g_pf_score = 0, g_pf_soft = 0, g_pf_val = 0, g_pf_gate = 0;
 double g_pf_moe_q = 0, g_pf_moe_gu = 0, g_pf_moe_dn = 0;
@@ -2487,8 +2494,10 @@ struct Engine {
                 // FP16 probabilities; the queries in slices whose scores fit
                 const int P = (int) p0 + T;
                 const int ldp = (P + 7) / 8 * 8;
-                const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (kAttScoreFloats / ((size_t) H * ldp))));
                 const int G = H / HKV;
+                // STRATA_Q36_ATTN_KSEQ (default 1) sizes the score buffer for one KV head's slice, G*nt*ldp floats
+                // instead of H*nt*ldp, so the same buffer carries twice the query rows per slice.
+                const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (kAttScoreFloats / ((size_t) (g_attn_kseq ? G : H) * ldp))));
                 const float one = 1.0f, zero = 0.0f;
                 // The two attention GEMMs are skinny: K is HD = 256 for the scores and P (thousands) for the values, and
                 // the batch is only G = 8.  cuBLAS's default heuristic picks a SIMT kernel for them on Turing: measured on
@@ -2502,6 +2511,15 @@ struct Engine {
                     const int n = std::atoi(v);
                     return n < 0 ? CUBLAS_GEMM_DEFAULT : (cublasGemmAlgo_t) n;
                 }();
+                {   // STRATA_Q36_ATTN_DBG: the prompt attention's slice shape, once per process
+                    static const bool adbg = std::getenv("STRATA_Q36_ATTN_DBG") != nullptr;
+                    static int once = 0;
+                    if (adbg && once < 4) {
+                        std::fprintf(stderr, "strata-q36: attn dbg P=%d ldp=%d T=%d tq=%d nsl=%d G=%d H=%d merge=%d kseq=%d algo=%d\n",
+                                     P, ldp, T, tq, (T + tq - 1) / tq, G, H, (int) g_attn_merge, (int) g_attn_kseq, (int) attn_algo);
+                        ++once;
+                    }
+                }
                 const bool pfa = g_pf_on; double pt1 = pfa ? pf_now_ms() : 0.0;
                 k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(q, q16, (int64_t) T * H * HD);
                 // the prompt's two attention GEMMs take FP16 operands, so the 8-bit cache's live rows [0, P) are
@@ -2523,12 +2541,22 @@ struct Engine {
                                                                 v16, HKV, ctx, HD, P);
                 }
                 if (pfa) { cudaStreamSynchronize(st); const double pf_n = pf_now_ms(); g_pf_prep += pf_n - pt1; pt1 = pf_n; }
+                // STRATA_Q36_ATTN_KSEQ: one KV head per pass, so the other head's slices reuse the same score buffer
+                // rows and the slice is twice as wide; the older layout visits both heads inside one t0 loop.
+                // kseq: one KV head per pass (the score buffer holds that head's G*nt rows only); 0 keeps both
+                // heads inside one t0 loop, which needs H*nt rows and the older tq.
+                const int kvh_step = g_attn_kseq ? 1 : HKV;
+                for (int k0 = 0; k0 < HKV; k0 += kvh_step) {
+                const int k1 = std::min(HKV, k0 + kvh_step);
                 for (int t0 = 0; t0 < T; t0 += tq) {
                     const int nt = std::min(tq, T - t0);
-                    for (int kvh = 0; kvh < HKV; ++kvh) {
+                    for (int kvh = k0; kvh < k1; ++kvh) {
                         // the widened copy, each KV head's [0, P) rows contiguous
                         const __half* Kh = k16 + (size_t) kvh * ctx * HD;
-                        float* Sh = att_s + (size_t) kvh * G * nt * ldp;
+                        // the score rows belong to one KV head's G query heads, so a per-KV-head pass reuses the
+                        // same G*nt rows (khi = kvh - k0 is 0 inside such a pass)
+                        const int khi = kvh - k0;
+                        float* Sh = att_s + (size_t) khi * G * nt * ldp;
                         // STRATA_Q36_ATTN_MERGE: the G query heads of a KV head share one K, but as a strided batch of
                         // n = nt cuBLAS reads K once per head and runs a band a tenth of a tile wide.  Repacked b-major,
                         // one GEMM of n = G*nt reads K once and its columns land where the strided batch put them.
@@ -2552,12 +2580,13 @@ struct Engine {
                         }
                     }
                     if (pfa) { cudaStreamSynchronize(st); const double pf_n = pf_now_ms(); g_pf_score += pf_n - pt1; pt1 = pf_n; }
-                    k_attn_softmax16<<<dim3(nt, H), kThreads, 0, st>>>(att_s, att_p16, ldp, nt, P, (int) p0 + t0,
-                                                                       1.0f / sqrtf((float) HD));
+                    // the buffer holds only this pass's KV heads: G*nt rows, or H*nt when both heads are in one pass
+                    k_attn_softmax16<<<dim3(nt, g_attn_kseq ? G : H), kThreads, 0, st>>>(att_s, att_p16, ldp, nt, P,
+                                                                       (int) p0 + t0, 1.0f / sqrtf((float) HD));
                     if (pfa) { cudaStreamSynchronize(st); const double pf_n = pf_now_ms(); g_pf_soft += pf_n - pt1; pt1 = pf_n; }
-                    for (int kvh = 0; kvh < HKV; ++kvh) {
+                    for (int kvh = k0; kvh < k1; ++kvh) {
                         const __half* Vh = v16 + (size_t) kvh * ctx * HD;
-                        const __half* Sh = att_p16 + (size_t) kvh * G * nt * ldp;
+                        const __half* Sh = att_p16 + (size_t) (kvh - k0) * G * nt * ldp;
                         float* Oh = att + ((size_t) t0 * H + kvh * G) * HD;
                         if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, nt, P, &one, Vh, CUDA_R_16F, HD,
                                                        0, Sh, CUDA_R_16F, ldp, (long long) nt * ldp, &zero, Oh, CUDA_R_32F,
@@ -2568,6 +2597,7 @@ struct Engine {
                         }
                     }
                 }
+                }  // the KV-head pass
                 if (pfa) { cudaStreamSynchronize(st); const double pf_n = pf_now_ms(); g_pf_val += pf_n - pt1; pt1 = pf_n; }
                 if (g_kv_mode != 1)   // the values were mixed in the rotated basis: back before the gate
                     k_fwht_rows<<<(unsigned) ((int64_t) T * H), kThreads, 0, st>>>(att, (int64_t) T * H);
