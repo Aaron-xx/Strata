@@ -1793,7 +1793,10 @@ struct Engine {
         }
         att_s = dalloc(kAttScoreFloats);
         sk_part = dalloc((size_t) kSplitK * T * (g.n_expert + 1));
-        att_p16 = dalloc_t<__half>(kAttScoreFloats);
+        // STRATA_Q36_ATTN_S16 writes the probabilities back into att_s, so this copy is dead weight then: leaving it
+        // out gives the prompt chunk 64 MiB (at 32 Mi floats) of VRAM, which a bigger chunk needs.
+        if (!g_attn_s16)
+            att_p16 = dalloc_t<__half>(kAttScoreFloats);
         q16 = dalloc_t<__half>(T * g.n_head * g.head_dim);
         if (g_attn_merge)
             qm = dalloc_t<__half>((size_t) (g.n_head / std::max(1, (int) g.n_head_kv)) * T * g.head_dim);
@@ -3108,10 +3111,11 @@ struct Engine {
     void shrink_att(size_t floats) {
         CK(cudaDeviceSynchronize());
         CK(cudaFree(att_s));
-        CK(cudaFree(att_p16));
+        if (att_p16) CK(cudaFree(att_p16));
         kAttScoreFloats = floats;
         att_s = dalloc(kAttScoreFloats);
-        att_p16 = dalloc_t<__half>(kAttScoreFloats);
+        if (!g_attn_s16)
+            att_p16 = dalloc_t<__half>(kAttScoreFloats);
         CK(cudaDeviceSynchronize());
     }
     void reset_graphs() {
@@ -3628,7 +3632,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     for (Layer& L : m.layers) total_main += L.stride * (size_t) ne + kMmqTail;
     bool mtp_only = false;
     if (slots <= 0 && vram_gib < 0 && m.has_mtp && total > budget2 && std::getenv("STRATA_Q36_NO_MTP_CPU") == nullptr) {
-        const size_t att_save = (E.kAttScoreFloats - ((size_t) 16 << 20)) * 6;   // att_s (4 B) + att_p16 (2 B)
+        const size_t att_save = (E.kAttScoreFloats - ((size_t) 16 << 20)) * (E.att_p16 ? 6 : 4);   // att_s (4 B) + att_p16 (2 B)
         const size_t small_reserve = (size_t) 256 << 20;
         const size_t room = fr + att_save > small_reserve ? fr + att_save - small_reserve : 0;
         if (total_main + ((size_t) 64 << 20) <= budget2) {
