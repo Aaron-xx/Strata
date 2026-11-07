@@ -25,7 +25,9 @@
     "STRATA_Q36_SNAP": "48",
     "STRATA_Q36_SNAP_TAIL": "8",
     "STRATA_Q36_ATTN_MERGE": "1",
-    "STRATA_Q36_ATTN_KSEQ": "1"
+    "STRATA_Q36_ATTN_KSEQ": "1",
+    "STRATA_Q36_ATTN_S16": "1",
+    "STRATA_ATTN_ALGO16": "1"
   },
   "parallel": 1,
   "port": 8000,

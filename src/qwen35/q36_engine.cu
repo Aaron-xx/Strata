@@ -63,6 +63,13 @@ bool g_attn_kseq = [] {
     const char* v = std::getenv("STRATA_Q36_ATTN_KSEQ");
     return !(v && v[0] == '0');
 }();
+// STRATA_Q36_ATTN_S16 (opt-in): the prompt's score GEMM accumulates in FP16 and writes FP16 scores, which softmax
+// reads in place; the FP32 score buffer then carries the FP16 probabilities instead of the scores (no extra VRAM).
+// Measured on this card (GTX 1660 Ti, sm_75) at the slice P=98304 nt=42 G=8 HD=256: CUBLAS_COMPUTE_32F + ALGO3
+// 4.68 ms and 3.6 TFLOP/s, CUBLAS_COMPUTE_16F + ALGO1 2.14 ms and 7.9 TFLOP/s (2.2x); FP16 accumulation with a
+// FP32 output is CUBLAS_STATUS_NOT_SUPPORTED on sm_75, so the scores are FP16 either way.  The product is the same
+// sum in another order with a half-precision accumulator: off by default (default path byte-identical).
+bool g_attn_s16 = std::getenv("STRATA_Q36_ATTN_S16") != nullptr;
 double g_pf_dense = 0, g_pf_attn = 0, g_pf_moe = 0;
 double g_pf_prep = 0, g_pf_score = 0, g_pf_soft = 0, g_pf_val = 0, g_pf_gate = 0;
 double g_pf_moe_q = 0, g_pf_moe_gu = 0, g_pf_moe_dn = 0;
@@ -784,6 +791,24 @@ __global__ void k_attn_softmax16(const float* S, __half* S16, int ld, int T, int
     sum = block_sum(sum, sh);
     const float inv = 1.0f / sum;
     for (int p = threadIdx.x; p < P; p += blockDim.x) out[p] = __float2half(p < n ? expf(row[p] * scale - mx) * inv : 0.f);
+}
+/// STRATA_Q36_ATTN_S16: the same causal softmax over FP16 scores (the score GEMM's own output type on sm_75), read
+/// in place and written as FP16 probabilities.  grid (T, H), block 256.
+__global__ void k_attn_softmax16h(const __half* S, __half* S16, int ld, int T, int P, int pos0, float scale) {
+    __shared__ float sh[kThreads];
+    const int t = blockIdx.x, h = blockIdx.y;
+    const __half* row = S + ((size_t) h * T + t) * ld;
+    __half* out = S16 + ((size_t) h * T + t) * ld;
+    const int n = min(P, pos0 + t + 1);
+    float mx = -INFINITY;
+    for (int p = threadIdx.x; p < n; p += blockDim.x) mx = fmaxf(mx, __half2float(row[p]) * scale);
+    mx = block_max(mx, sh);
+    float sum = 0.f;
+    for (int p = threadIdx.x; p < n; p += blockDim.x) sum += expf(__half2float(row[p]) * scale - mx);
+    sum = block_sum(sum, sh);
+    const float inv = 1.0f / sum;
+    for (int p = threadIdx.x; p < P; p += blockDim.x)
+        out[p] = __float2half(p < n ? expf(__half2float(row[p]) * scale - mx) * inv : 0.f);
 }
 /// att *= sigmoid(gate) (the attention output gate), n values.
 __global__ void k_gate_mul(float* att, const float* gate, int64_t n) {
@@ -2497,7 +2522,9 @@ struct Engine {
                 const int G = H / HKV;
                 // STRATA_Q36_ATTN_KSEQ (default 1) sizes the score buffer for one KV head's slice, G*nt*ldp floats
                 // instead of H*nt*ldp, so the same buffer carries twice the query rows per slice.
-                const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (kAttScoreFloats / ((size_t) (g_attn_kseq ? G : H) * ldp))));
+                // STRATA_Q36_ATTN_S16 stores the scores as halves, so the same buffer carries twice the rows.
+                const int64_t score_slots = (int64_t) kAttScoreFloats * (g_attn_s16 ? 2 : 1);
+                const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, score_slots / ((int64_t) (g_attn_kseq ? G : H) * ldp)));
                 const float one = 1.0f, zero = 0.0f;
                 // The two attention GEMMs are skinny: K is HD = 256 for the scores and P (thousands) for the values, and
                 // the batch is only G = 8.  cuBLAS's default heuristic picks a SIMT kernel for them on Turing: measured on
@@ -2511,12 +2538,23 @@ struct Engine {
                     const int n = std::atoi(v);
                     return n < 0 ? CUBLAS_GEMM_DEFAULT : (cublasGemmAlgo_t) n;
                 }();
+                // STRATA_Q36_ATTN_S16's score GEMM: a half-precision accumulator takes ALGO0..ALGO4 only, and the
+                // default heuristic answers this shape with a SIMT kernel (29.8 ms against 2.1).  Measured at
+                // P=98304 nt=42 G=8 HD=256: ALGO1 2.137 ms (7.9 TFLOP/s), ALGO3 2.447 (6.9), ALGO2 4.636 (3.7).
+                static const cublasGemmAlgo_t attn_algo16 = [] {
+                    const char* v = std::getenv("STRATA_ATTN_ALGO16");
+                    if (!v || !v[0]) return CUBLAS_GEMM_ALGO1;
+                    const int n = std::atoi(v);
+                    return n < 0 ? CUBLAS_GEMM_DEFAULT : (cublasGemmAlgo_t) n;
+                }();
+                const __half one16 = __float2half(1.0f), zero16 = __float2half(0.0f);
                 {   // STRATA_Q36_ATTN_DBG: the prompt attention's slice shape, once per process
                     static const bool adbg = std::getenv("STRATA_Q36_ATTN_DBG") != nullptr;
                     static int once = 0;
                     if (adbg && once < 4) {
-                        std::fprintf(stderr, "strata-q36: attn dbg P=%d ldp=%d T=%d tq=%d nsl=%d G=%d H=%d merge=%d kseq=%d algo=%d\n",
-                                     P, ldp, T, tq, (T + tq - 1) / tq, G, H, (int) g_attn_merge, (int) g_attn_kseq, (int) attn_algo);
+                        std::fprintf(stderr, "strata-q36: attn dbg P=%d ldp=%d T=%d tq=%d nsl=%d G=%d H=%d merge=%d kseq=%d s16=%d algo=%d\n",
+                                     P, ldp, T, tq, (T + tq - 1) / tq, G, H, (int) g_attn_merge, (int) g_attn_kseq,
+                                     (int) g_attn_s16, (int) (g_attn_s16 ? attn_algo16 : attn_algo));
                         ++once;
                     }
                 }
@@ -2556,20 +2594,33 @@ struct Engine {
                         // the score rows belong to one KV head's G query heads, so a per-KV-head pass reuses the
                         // same G*nt rows (khi = kvh - k0 is 0 inside such a pass)
                         const int khi = kvh - k0;
+                        // STRATA_Q36_ATTN_S16: the scores land at the front of the same buffer as halves (G*nt*ldp
+                        // halves are half the floats the slice was sized for), and the probabilities in att_p16.
                         float* Sh = att_s + (size_t) khi * G * nt * ldp;
+                        __half* Sh16 = ((__half*) att_s) + (size_t) khi * G * nt * ldp;
                         // STRATA_Q36_ATTN_MERGE: the G query heads of a KV head share one K, but as a strided batch of
                         // n = nt cuBLAS reads K once per head and runs a band a tenth of a tile wide.  Repacked b-major,
                         // one GEMM of n = G*nt reads K once and its columns land where the strided batch put them.
                         cublasStatus_t gst;
                         if (g_attn_merge) {
                             k_q_merge<<<dim3(nt, G), kThreads, 0, st>>>(q16, qm, t0, H, kvh, G, nt, HD);
-                            gst = cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt * G, HD, &one, Kh,
+                            gst = g_attn_s16
+                                ? cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt * G, HD, &one16, Kh,
+                                                             CUDA_R_16F, HD, 0, qm, CUDA_R_16F, HD, HD, &zero16, Sh16,
+                                                             CUDA_R_16F, ldp, (long long) nt * G * ldp, 1,
+                                                             CUBLAS_COMPUTE_16F, attn_algo16)
+                                : cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt * G, HD, &one, Kh,
                                                              CUDA_R_16F, HD, 0, qm, CUDA_R_16F, HD, HD, &zero, Sh,
                                                              CUDA_R_32F, ldp, (long long) nt * G * ldp, 1,
                                                              CUBLAS_COMPUTE_32F, attn_algo);
                         } else {
                             const __half* Qh = q16 + ((size_t) t0 * H + kvh * G) * HD;
-                            gst = cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &one, Kh,
+                            gst = g_attn_s16
+                                ? cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &one16, Kh,
+                                                             CUDA_R_16F, HD, 0, Qh, CUDA_R_16F, H * HD, HD, &zero16, Sh16,
+                                                             CUDA_R_16F, ldp, (long long) nt * ldp, G,
+                                                             CUBLAS_COMPUTE_16F, attn_algo16)
+                                : cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &one, Kh,
                                                              CUDA_R_16F, HD, 0, Qh, CUDA_R_16F, H * HD, HD, &zero, Sh,
                                                              CUDA_R_32F, ldp, (long long) nt * ldp, G,
                                                              CUBLAS_COMPUTE_32F, attn_algo);
@@ -2581,12 +2632,17 @@ struct Engine {
                     }
                     if (pfa) { cudaStreamSynchronize(st); const double pf_n = pf_now_ms(); g_pf_score += pf_n - pt1; pt1 = pf_n; }
                     // the buffer holds only this pass's KV heads: G*nt rows, or H*nt when both heads are in one pass
-                    k_attn_softmax16<<<dim3(nt, g_attn_kseq ? G : H), kThreads, 0, st>>>(att_s, att_p16, ldp, nt, P,
+                    if (g_attn_s16)   // in place: the slice holds att_s' halves, so no second buffer and no overflow
+                        k_attn_softmax16h<<<dim3(nt, g_attn_kseq ? G : H), kThreads, 0, st>>>(
+                            (const __half*) att_s, (__half*) att_s, ldp, nt, P, (int) p0 + t0, 1.0f / sqrtf((float) HD));
+                    else
+                        k_attn_softmax16<<<dim3(nt, g_attn_kseq ? G : H), kThreads, 0, st>>>(att_s, att_p16, ldp, nt, P,
                                                                        (int) p0 + t0, 1.0f / sqrtf((float) HD));
                     if (pfa) { cudaStreamSynchronize(st); const double pf_n = pf_now_ms(); g_pf_soft += pf_n - pt1; pt1 = pf_n; }
                     for (int kvh = k0; kvh < k1; ++kvh) {
                         const __half* Vh = v16 + (size_t) kvh * ctx * HD;
-                        const __half* Sh = att_p16 + (size_t) (kvh - k0) * G * nt * ldp;
+                        const __half* Sh = (g_attn_s16 ? (const __half*) att_s : att_p16) +
+                                          (size_t) (kvh - k0) * G * nt * ldp;
                         float* Oh = att + ((size_t) t0 * H + kvh * G) * HD;
                         if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, nt, P, &one, Vh, CUDA_R_16F, HD,
                                                        0, Sh, CUDA_R_16F, ldp, (long long) nt * ldp, &zero, Oh, CUDA_R_32F,
