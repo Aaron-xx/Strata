@@ -71,11 +71,33 @@ Before merging, the read-only state was:
   repo open issues               0
 Actions is therefore ALREADY ENABLED on this fork; an empty workflows list
 means no workflow has been registered yet, not that Actions is off. The first
-push to main registers and runs them. Two things still need doing by hand:
-  1. Enable the issue tracker (has_issues=false => gh issue create returns 410).
-     gh api -X PATCH repos/Aaron-xx/Strata -F has_issues=true
-  2. Merge ci/upstream-robot into fork main (a fast-forward), then run both
-     workflows once with workflow_dispatch and confirm PASS before relying on
-     the nightly schedule.
-The repo-level token default is read, which is why BOTH workflows declare their
-own permissions block (contents/actions: write / contents: read + issues: write).
+push to main registers and runs them. The repo-level token default is read,
+which is why BOTH workflows declare their own permissions block
+(contents/actions: write / contents: read + issues: write).
+
+## Verification (measured on this fork, 2026-11-08; both hand steps DONE)
+  - git push ci/upstream-robot -> fork main: 146df3c4..3c230977, a clean
+    fast-forward. The four fork-only files are on the default branch, so the
+    nightly timers are live.
+  - gh api -X PATCH repos/Aaron-xx/Strata -F has_issues=true -> true; the
+    issue tracker is on and gh issue create no longer returns 410.
+  - gh api actions/workflows: 10 active, including "Sync fork with upstream"
+    and "Upstream robot smoke test". Cron 03:17 UTC (sync) / 03:41 UTC (robot).
+  - manual workflow_dispatch, "Sync fork with upstream" run 42471114640:
+    success. "Merge upstream main into this fork main" success; "Kick the
+    robot test on the new main" skipped because fork main already contains
+    upstream 146df3c4 as an ancestor (changed=false, so no push and no
+    dispatch). This is the intended no-op when nothing new arrived.
+  - manual workflow_dispatch, "Upstream robot smoke test" run 42471122200:
+    success in 10 min 54 s (10:21:59Z -> 10:32:53Z). All four upstream
+    commands passed, including the full serve unittest discovery (81 files)
+    and the node item-check test. "Report a bug when the smoke test fails"
+    correctly skipped; no issue was opened.
+  - The push-triggered robot run 42471064684 was cancelled by the workflow's
+    own concurrency group when the manual dispatch took over. Expected.
+  - strata-serve on the 6 GB host stayed active / 5672 MiB throughout.
+Remaining unverified: the failure -> issue branch has not been triggered on
+purpose, because doing so would publish a real issue on this fork. To close
+that loop, push a deliberately failing test on a topic branch (not main) or
+temporarily break a step, then confirm exactly one deduplicated issue and
+close it afterwards.
