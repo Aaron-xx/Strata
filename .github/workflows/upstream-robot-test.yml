@@ -1,0 +1,64 @@
+name: Upstream robot smoke test
+
+# Half 2: run the SAME commands upstream runs in its own CI. On failure the
+# job opens one bug issue per SHA, the entry point of the fix -> PR -> re-run
+# loop described in docs/CI_AUTOMATION.md. No GPU, no model download.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "41 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: robot-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Upstream terminal-minimal-server.yml installs only these before its tests.
+      - name: Install pinned runtime requirements
+        run: python -m pip install -r requirements.txt
+
+      - name: Byte-compile the Python sources
+        run: python -m compileall -q strata.py strata_cli strata_control serve tools
+
+      # Canonical upstream invocations, copied from its own workflows:
+      #   terminal-minimal-server.yml -> unittest discover -s serve
+      #   scripts-test.yml            -> node --test item-check.test.js
+      - name: Server unit tests (upstream terminal-minimal-server.yml)
+        run: python -m unittest discover -s serve -p "test_*.py"
+
+      - name: Intake script test (upstream scripts-test.yml)
+        run: node --test .github/scripts/item-check.test.js
+
+      - name: Report a bug when the smoke test fails
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sha="${{ github.sha }}"
+          title="[robot] smoke test failed on $sha"
+          url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          open=$(gh issue list --repo Aaron-xx/Strata --state open --search "$sha in:title" --json number --jq length 2>/dev/null || echo 0)
+          if [ "$open" = "0" ]; then
+            gh issue create --repo Aaron-xx/Strata --title "$title" --body "Run: $url SHA: $sha"
+          else
+            echo "an issue is already open for this SHA, nothing to do"
+          fi
