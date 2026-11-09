@@ -626,7 +626,9 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     # renders the prompt without it (STRATA_SERVE_THINK_MAX overrides the threshold).
     if "enable_thinking" not in kwargs:
         cap = req.get("max_completion_tokens", req.get("max_tokens"))
-        think_max = int(os.environ.get("STRATA_SERVE_THINK_MAX", "512"))
+        # Default 0 (off): upstream test_server.py expects unmodified behaviour.
+        # The 6 GB serve script opts in explicitly with STRATA_SERVE_THINK_MAX=512.
+        think_max = int(os.environ.get("STRATA_SERVE_THINK_MAX", "0"))
         if isinstance(cap, int) and not isinstance(cap, bool) and 0 < cap <= think_max:
             kwargs["enable_thinking"] = False
     return _env_to_user(_late_system_to_user(messages)), tools, kwargs

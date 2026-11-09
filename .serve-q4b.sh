@@ -11,4 +11,9 @@ sudo -n nvidia-smi -pm 1 >/dev/null 2>&1 || true
 sudo -n nvidia-smi -lgc 2100,2100 >/dev/null 2>&1 || true
 export STRATA_Q36_PREFILL_TIMING=1
 export STRATA_SERVE_PROMPT_DIFF=1
+# DSH helper calls (session titles, one-line checks) send a small token budget; opt in
+
+# to the fork-only thinking-off helper (kept out of the default path: issue #1/#2).
+
+export STRATA_SERVE_THINK_MAX=512
 exec /home/aaron/miniconda3/envs/strata/bin/python serve/server.py --engine strata --config .serve-q4ks2.json --port 8000 --host 0.0.0.0 > /home/aaron/ai/Strata/.serve-q4b.log 2>&1
