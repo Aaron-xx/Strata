@@ -1,0 +1,60 @@
+name: Sync fork with upstream
+
+# Half 1 of the robot loop: keep this fork main equal to upstream main plus
+# the fork-only CI files. Scheduled workflows run on the DEFAULT branch only;
+# perf/6gb-production is the default branch, so this copy is the one whose
+# schedule fires. The job checks out ref: main explicitly and operates there,
+# so main stays the upstream-tracking branch (two-line CI design).
+#
+# Two deliberate design choices:
+# 1) A plain git merge, not the merge-upstream REST endpoint. That endpoint
+#    only fast-forwards; once main carries our fork-only commits it would
+#    return 409 Conflict on every later run. A merge keeps our files and
+#    still pulls in every upstream commit.
+# 2) An explicit gh workflow run after the push. Pushes made with the
+#    GITHUB_TOKEN do NOT trigger other workflows (GitHub loop prevention),
+#    so we must dispatch the robot test ourselves.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream main into this fork main
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/Niko1221/Strata.git
+          git fetch --no-tags upstream main
+          before=$(git rev-parse HEAD)
+          git merge --no-edit upstream/main
+          echo "fork main before: $before"
+          echo "upstream main:    $(git rev-parse upstream/main)"
+          echo "fork main after:  $(git rev-parse HEAD)"
+          if [ "$before" = "$(git rev-parse HEAD)" ]; then
+            echo "already up to date, nothing to push"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git push origin HEAD:main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Kick the robot test on the new main
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run upstream-robot-test.yml --ref main
