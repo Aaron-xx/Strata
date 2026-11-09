@@ -1,0 +1,20 @@
+[Unit]
+Description=Strata q36 engine (systemd --user) serving Qwen3.6-35B-A3B on 0.0.0.0:8000
+Documentation=file:///home/aaron/ai/Strata/REPORT-6GB-2026-10-31.md
+# No RequiresMountsFor=/data: a user manager cannot depend on a system-manager .mount unit.
+# ExecStartPre below + Restart=on-failure cover the boot race instead.
+
+[Service]
+Type=simple
+WorkingDirectory=/home/aaron/ai/Strata
+ExecStartPre=/usr/bin/test -d /data/strata-research/models/tokenizer
+ExecStart=/bin/bash /home/aaron/ai/Strata/.serve-q4b.sh
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=900
+TimeoutStopSec=120
+KillMode=control-group
+SuccessExitStatus=0 143
+
+[Install]
+WantedBy=default.target
