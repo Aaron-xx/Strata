@@ -15,6 +15,7 @@ TimeoutStartSec=900
 TimeoutStopSec=120
 KillMode=control-group
 SuccessExitStatus=0 143
+ExecStopPost=/bin/bash /home/aaron/ai/Strata/deploy/gpu-clock-release.sh
 
 [Install]
 WantedBy=default.target
