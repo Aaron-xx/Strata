@@ -2,7 +2,7 @@
   "arch": "qwen35moe",
   "exe": "/home/aaron/ai/Strata/build/strata",
   "model_name": "qwen3.6-35b-a3b-q4ks",
-  "tokenizer": "/data/strata-research/models/tokenizer",
+  "tokenizer": "/home/aaron/ai/Strata-data/packs/qwen36-ud-q4_k_xl/tokenizer",
   "args": [
     "--native",
     "/home/aaron/models/Qwen3.6-35B-A3B-UD-Q4_K_S.gguf",

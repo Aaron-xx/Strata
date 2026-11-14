@@ -7,7 +7,7 @@ Documentation=file:///home/aaron/ai/Strata/REPORT-6GB-2026-10-31.md
 [Service]
 Type=simple
 WorkingDirectory=/home/aaron/ai/Strata
-ExecStartPre=/usr/bin/test -d /data/strata-research/models/tokenizer
+ExecStartPre=/usr/bin/test -d /home/aaron/ai/Strata-data/packs/qwen36-ud-q4_k_xl/tokenizer
 ExecStart=/bin/bash /home/aaron/ai/Strata/.serve-q4b.sh
 Restart=on-failure
 RestartSec=30
